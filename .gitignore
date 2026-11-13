@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.*
+!.env.example
+dist/
+out/
+data/
+*.log
+.claude/settings.local.json
+local-start.bat

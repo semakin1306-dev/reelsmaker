@@ -1,0 +1,19 @@
+{
+  "name": "@reels-factory/hub",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Локальный интерфейс ReelsMaker: сюжеты, расшифровка, сборка вариантов, просмотр",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "start": "node --import tsx src/main.ts"
+  },
+  "dependencies": {
+    "@reels-factory/core": "*",
+    "@reels-factory/render": "*",
+    "@reels-factory/pc-agent": "*"
+  }
+}

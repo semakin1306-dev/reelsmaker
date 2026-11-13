@@ -1,0 +1,17 @@
+{
+  "name": "@reels-factory/pc-agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Станция на ПК: папка входа, ffprobe, расшифровка моделью службы голосового ввода, transcript.json",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@reels-factory/core": "*",
+    "@reels-factory/render": "*"
+  }
+}

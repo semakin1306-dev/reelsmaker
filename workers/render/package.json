@@ -1,0 +1,16 @@
+{
+  "name": "@reels-factory/render",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Сборщик роликов: planner и ffmpeg (RF2)",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@reels-factory/core": "*"
+  }
+}

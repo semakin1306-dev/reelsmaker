@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" width="192" height="192">
+  <!-- Значок ReelsMaker: вертикальный кадр-плёнка 9:16 с «плей», в углу — искра агента-монтажёра.
+       Источник для ico (ярлык) и иконки окна: node desktop/make-icon.mjs -->
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7c5cff"/>
+      <stop offset="1" stop-color="#e2448f"/>
+    </linearGradient>
+    <linearGradient id="s" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity=".22"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="scr" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b1f6b"/>
+      <stop offset="1" stop-color="#5a1f52"/>
+    </linearGradient>
+  </defs>
+  <rect width="192" height="192" rx="44" fill="url(#g)"/>
+  <path d="M44 0h104a44 44 0 0 1 44 44v56H0V44A44 44 0 0 1 44 0z" fill="url(#s)"/>
+  <rect x="56" y="26" width="80" height="140" rx="14" fill="#fff"/>
+  <g fill="#c24fb4">
+    <rect x="61" y="38" width="8" height="11" rx="2.5"/><rect x="61" y="58" width="8" height="11" rx="2.5"/>
+    <rect x="61" y="78" width="8" height="11" rx="2.5"/><rect x="61" y="98" width="8" height="11" rx="2.5"/>
+    <rect x="61" y="118" width="8" height="11" rx="2.5"/><rect x="61" y="138" width="8" height="11" rx="2.5"/>
+    <rect x="123" y="38" width="8" height="11" rx="2.5"/><rect x="123" y="58" width="8" height="11" rx="2.5"/>
+    <rect x="123" y="78" width="8" height="11" rx="2.5"/><rect x="123" y="98" width="8" height="11" rx="2.5"/>
+    <rect x="123" y="118" width="8" height="11" rx="2.5"/><rect x="123" y="138" width="8" height="11" rx="2.5"/>
+  </g>
+  <rect x="74" y="36" width="44" height="120" rx="7" fill="url(#scr)"/>
+  <path d="M88 80 L88 112 L113 96 Z" fill="#fff" stroke="#fff" stroke-width="5" stroke-linejoin="round"/>
+  <circle cx="153" cy="153" r="23" fill="#fff"/>
+  <path d="M153 137 C154.6 147.5 158.5 151.4 169 153 C158.5 154.6 154.6 158.5 153 169 C151.4 158.5 147.5 154.6 137 153 C147.5 151.4 151.4 147.5 153 137 Z" fill="url(#g)"/>
+</svg>

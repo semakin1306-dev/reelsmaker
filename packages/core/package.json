@@ -1,0 +1,11 @@
+{
+  "name": "@reels-factory/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Модель, схемы, база SQLite, миграции, конфиг, обёртка запуска программ",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
+  }
+}
