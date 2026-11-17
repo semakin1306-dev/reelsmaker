@@ -88,6 +88,13 @@ export const PAGE_HTML = /* html */ `<!doctype html>
   .frames img { height:150px; border-radius:4px; display:block; cursor:zoom-in; }
   .reps { max-height:320px; overflow:auto; }
   .reps td:first-child, .reps td:nth-child(2) { white-space:nowrap; color:var(--muted); font-size:12px; }
+  table.plan td { font-size:12px; padding:3px 8px; }
+  table.plan td:nth-child(3) { color:var(--acc); }
+  .rec-dot { display:inline-block; width:11px; height:11px; border-radius:50%; background:var(--bad); animation:blink 1s infinite; }
+  @keyframes blink { 50% { opacity:.25; } }
+  .lv { display:inline-block; width:140px; height:8px; background:var(--line); border-radius:4px; overflow:hidden; }
+  .lv > i { display:block; height:100%; width:0; background:var(--ok); transition:width .1s; }
+  audio.voice { height:34px; max-width:100%; }
   .seg { display:inline-block; padding:1px 6px; margin:1px 2px; border-radius:6px; background:var(--line); font-size:12px; }
   #agentBar { display:none; position:sticky; top:-14px; z-index:5; margin:-14px -18px 12px; padding:10px 18px; background:#1a2233; border-bottom:1px solid #2f4268; }
   #agentBar.on { display:block; }
@@ -407,7 +414,8 @@ async function refreshRuns(story) {
 }
 
 // ── сюжет из исходников: роли, кадры, реплики, монтажный лист ──
-const ROLES = { talk: "основа (звук)", wide: "дальний план", screen: "скринкаст" };
+const ROLES = { talk: "основа (картинка и звук)", wide: "дальний план", screen: "скринкаст", voice: "озвучка (звук отдельным файлом, дублей может быть несколько)" };
+const isAudioName = (n) => /\\.(wav|mp3|m4a|aac|ogg|oga|opus|flac|wma)$/i.test(n);
 
 function renderMontage(d) {
   const m = d.montage;
@@ -416,25 +424,40 @@ function renderMontage(d) {
   const src = m.sources.map((s, i) => {
     const p = s.probe;
     return "<tr><td>" + esc(s.name) + '</td><td><select class="roleSel" data-name="' + esc(s.name) + '">' + opt(s.role) + "</select></td><td>" +
-      (p ? sec(p.duration) + " · " + p.width + "×" + p.height + " · " + (p.hasAudio ? "звук" : "без звука") : '<span class="bad">не читается</span>') +
+      (p ? sec(p.duration) + (p.width ? " · " + p.width + "×" + p.height : " · аудио") + " · " + (p.hasAudio ? "звук" : "без звука") : '<span class="bad">не читается</span>') +
       (s.crop ? ' <span class="cropTag" title="кроп">кроп ' + Math.round(s.crop.w * 100) + "×" + Math.round(s.crop.h * 100) + "%</span>" : "") +
-      '</td><td><a href="#" onclick="showGrid(' + i + ');return false" style="color:var(--acc)">кадры</a> · ' +
-      '<a href="#" onclick="cropOpen(' + i + ');return false" style="color:var(--acc)">кроп</a></td></tr>' +
+      '</td><td>' + (isAudioName(s.name) ? "" : '<a href="#" onclick="showGrid(' + i + ');return false" style="color:var(--acc)">кадры</a> · ' +
+      '<a href="#" onclick="cropOpen(' + i + ');return false" style="color:var(--acc)">кроп</a>') + "</td></tr>" +
       '<tr><td colspan="4" style="border:0;padding:0 8px"><div class="frames" id="fr' + i + '"></div></td></tr>';
   }).join("");
-  const reps = m.replicas.map((r) => "<tr><td>" + r.id + "</td><td>" + r.start.toFixed(1) + "–" + r.end.toFixed(1) + " с</td><td>" + esc(r.text) + "</td></tr>").join("");
-  const dis = state.stt ? "" : " disabled";
+  // звук — с озвучек, если они есть, иначе с основы (или никакого, если звук видео отключён)
+  const hasVoice = m.voices.length > 0;
+  const list = hasVoice ? m.voiceReplicas : m.replicas;
+  const trDone = hasVoice ? m.voices.every((v) => v.transcribed) : m.transcribed;
+  const trFresh = hasVoice ? m.voices.every((v) => v.fresh) : m.transcriptFresh;
+  const silent = m.sound === "none";
+  const what = hasVoice ? "озвучки" : "основу";
+  let lastSrc = null;
+  const reps = list.map((r) => {
+    const head = hasVoice && m.voices.length > 1 && r.source !== lastSrc ? '<tr><td colspan="3" style="color:var(--acc);padding-top:10px">' + esc(r.source) + "</td></tr>" : "";
+    lastSrc = r.source;
+    return head + "<tr><td>" + r.id + "</td><td>" + r.start.toFixed(1) + "–" + r.end.toFixed(1) + " с</td><td>" + esc(r.text) + "</td></tr>";
+  }).join("");
+  const dis = state.stt && !silent ? "" : " disabled";
   $("#detail").innerHTML =
     "<h2>" + esc(current) + ' <span class="tag">из исходников</span></h2>' +
     '<div class="muted">' + esc(m.dir) + ' · <a href="#" onclick="openFolder(&quot;inbox&quot;);return false" style="color:var(--acc)">открыть папку</a></div>' +
     (m.problems.length ? '<ul class="problems">' + m.problems.map((x) => "<li>" + esc(x) + "</li>").join("") + "</ul>" : "") +
     "<h3>Исходники</h3><table>" + src + "</table>" +
     '<div style="margin-top:6px"><button class="sec" onclick="saveRoles()">Сохранить роли</button></div>' +
-    "<h3>Реплики основы (" + m.replicas.length + ")</h3>" +
-    (reps ? '<div class="reps"><table>' + reps + "</table></div>" : '<p class="muted">Основа ещё не расшифрована.</p>') +
-    '<div class="panel"><div class="row"><button id="btnTr" onclick="transcribe(false)"' + dis + ">Расшифровать основу</button>" +
+    "<h3>Озвучка</h3>" +
+    '<div class="panel" id="micBox"></div>' +
+    "<h3>Реплики " + (hasVoice ? "озвучек" : "основы") + " (" + list.length + ")</h3>" +
+    (reps ? '<div class="reps"><table>' + reps + "</table></div>"
+      : '<p class="muted">' + (silent ? "Звук видео не используется — расшифровывать нечего. Запишите озвучку микрофоном (кнопка выше) или положите аудиофайл в папку сюжета." : (hasVoice ? "Озвучки" : "Основа") + " ещё не расшифрован" + (hasVoice ? "ы" : "а") + ".") + "</p>") +
+    '<div class="panel"><div class="row"><button id="btnTr" onclick="transcribe(false)"' + dis + ">Расшифровать " + what + "</button>" +
     '<button class="sec" onclick="transcribe(true)"' + dis + ">заново</button>" +
-    '<span class="muted">' + (m.transcribed ? (m.transcriptFresh ? "расшифровка есть" : "расшифровка устарела") : "нет расшифровки") + "</span></div></div>" +
+    '<span class="muted">' + (silent ? "расшифровывать нечего" : trDone ? (trFresh ? "расшифровка есть" : "расшифровка устарела") : "нет расшифровки") + "</span></div></div>" +
     "<h3>Монтажный лист</h3>" +
     '<div id="editBox">' + (m.editError ? '<p class="bad">' + esc(m.editError) + "</p>"
       : m.edit ? '<p class="muted">проверяю…</p>'
@@ -459,6 +482,7 @@ function renderMontage(d) {
     '<button class="sec" onclick="checkEdit()"' + (m.edit ? "" : " disabled") + ">Проверить лист</button></div></div>" +
     '<div id="job"></div><div id="runs"></div>';
   $("#hw").value = state.hw;
+  micRender();
   renderRuns(d.runs);
   if (m.edit && !m.editError) checkEdit();
 }
@@ -473,6 +497,7 @@ async function checkEdit() {
       "<th>вариант</th><th>хук</th><th>реплики и план</th><th>оформление</th><th>длит.</th></tr>" +
       c.variants.map((v) => '<tr><td><input type="checkbox" class="vsel" value="' + esc(v.id) + '" checked onchange="updBuildBtn()"></td><td>' + esc(v.id) + "</td><td>" + esc(v.hook) + "</td><td>" +
         v.label.split(" → ").map((x) => '<span class="seg">' + esc(x) + "</span>").join("") +
+        planHtml(v) +
         "</td><td>" + esc(v.preset) + "</td><td>" + sec(v.duration) + "</td></tr>").join("") + "</table>" +
       (c.errors.length ? '<ul class="problems">' + c.errors.map((x) => '<li class="bad">' + esc(x) + "</li>").join("") + "</ul>" : "") +
       (c.warnings.length ? '<ul class="problems">' + c.warnings.map((x) => "<li>" + esc(x) + "</li>").join("") + "</ul>" : "");
@@ -483,16 +508,272 @@ async function checkEdit() {
   }
 }
 
+/** План варианта по сценам: время в ролике, реплика, что на экране, подпись монтажёра (или текст реплики). */
+function planHtml(v) {
+  if (!v.scenes || !v.scenes.length) return "";
+  const rows = v.scenes.map((s) =>
+    '<tr><td style="white-space:nowrap">' + s.from.toFixed(1) + "–" + s.to.toFixed(1) + " с</td><td><b>" + esc(s.id) + "</b></td><td>" + esc(s.visual) + "</td><td>" +
+    esc(s.note || s.text) + "</td></tr>").join("");
+  return '<details style="margin-top:6px"><summary class="muted" style="cursor:pointer">план по сценам (' + v.scenes.length + ')</summary>' +
+    '<table class="plan" style="margin-top:4px">' + rows + "</table></details>";
+}
+
 async function saveRoles() {
   // основа и дальний — по одному файлу; скринкастов может быть несколько
   const body = { talk: "", wide: "", screen: [] };
+  const voices = [];
   for (const s of document.querySelectorAll(".roleSel")) {
     if (!s.value) continue;
     if (s.value === "screen") { body.screen.push(s.dataset.name); continue; }
+    if (s.value === "voice") { voices.push(s.dataset.name); continue; }
     if (body[s.value]) { alert("Роль «" + ROLES[s.value] + "» назначена двум файлам"); return; }
     body[s.value] = s.dataset.name;
   }
+  // озвучки: все отмеченные; сняли со всех («—») — явный отказ; а если озвучек не было, ключ не шлём (иначе новые аудиофайлы не подберутся сами)
+  if (voices.length) body.voice = voices;
+  else if (window.curMontage.voices.length) body.voice = "";
   try { await api("/api/stories/" + enc(current) + "/roles", body); await openStory(current); } catch (e) { alert(e.message); }
+}
+
+// ── озвучка с микрофона: запись без потерь (PCM 24 бит) в этом окне → POST на сервер (wav 48 кГц в папку сюжета).
+// Каждая запись — новый файл и новая озвучка сюжета; монтажёр видит все и берёт лучшие дубли. ──
+const mic = { st: "idle", story: null, mode: "pcm", stream: null, ctx: null, node: null, an: null, buf: null, rec: null, chunks: [], rate: 48000, t0: 0, timer: null, ext: "wav", label: "" };
+const MIC_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:-2px"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-3.1A7 7 0 0 0 19 11h-2z"/></svg>';
+// процессор записи: копит отсчёты по 4096 и отдаёт основному потоку (Float32Array); "flush" — отдать остаток
+const MIC_WORKLET = 'class RmRec extends AudioWorkletProcessor {' +
+  ' constructor() { super(); this.b = new Float32Array(4096); this.n = 0; this.port.onmessage = () => { this.out(); this.port.postMessage("done"); }; }' +
+  ' out() { if (this.n) { this.port.postMessage(this.b.slice(0, this.n)); this.n = 0; } }' +
+  ' process(inputs) { const c = inputs[0] && inputs[0][0]; if (c) { for (let i = 0; i < c.length; i++) { this.b[this.n++] = c[i]; if (this.n === 4096) this.out(); } } return true; }' +
+  '} registerProcessor("rm-rec", RmRec);';
+
+/** Отсчёты (Float32, моно) → WAV PCM 24 бит. */
+function micWav(chunks, rate) {
+  let n = 0; for (const c of chunks) n += c.length;
+  const buf = new ArrayBuffer(44 + n * 3), v = new DataView(buf);
+  const str = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+  str(0, "RIFF"); v.setUint32(4, 36 + n * 3, true); str(8, "WAVE"); str(12, "fmt "); v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, rate, true); v.setUint32(28, rate * 3, true);
+  v.setUint16(32, 3, true); v.setUint16(34, 24, true); str(36, "data"); v.setUint32(40, n * 3, true);
+  let o = 44;
+  for (const c of chunks) for (let i = 0; i < c.length; i++) {
+    const x = Math.round(Math.max(-1, Math.min(1, c[i])) * 8388607);
+    v.setUint8(o++, x & 255); v.setUint8(o++, (x >> 8) & 255); v.setUint8(o++, (x >> 16) & 255);
+  }
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+async function voiceDel(i) {
+  const m = window.curMontage, v = m && m.voices[i]; if (!v) return;
+  // где озвучка уже стоит в листе: реплики с её буквой (b03…) и отрезки с voiceFile
+  const used = [];
+  if (m.edit && m.edit.variants) for (const vr of m.edit.variants) {
+    const hit = (vr.segments || []).some((sg) => (typeof sg.voice === "string" && sg.voice.charAt(0) === v.letter) ||
+      (sg.voiceFile && v.name.toLowerCase().indexOf(String(sg.voiceFile).toLowerCase()) === 0));
+    if (hit) used.push(vr.id);
+  }
+  const msg = "Убрать озвучку «" + v.name + "» (" + v.letter + ")?\\n\\nФайл не стирается — он уйдёт в папку .rm/trash внутри сюжета, монтажёр его больше не увидит." +
+    (used.length ? "\\n\\nВНИМАНИЕ: она используется в вариантах " + used.join(", ") + " — пока монтажёр не поправит лист, проверка покажет там ошибки." : "");
+  if (!confirm(msg)) return;
+  try { await api("/api/stories/" + enc(current) + "/voice/delete", { name: v.name }); await openStory(current, true); } catch (e) { alert(e.message); }
+}
+
+async function setClean(on) {
+  try {
+    await api("/api/stories/" + enc(current) + "/settings", { voiceClean: on });
+    if (on && window.curMontage && window.curMontage.voices.length) {
+      const box = $("#micBox"); if (box) box.innerHTML = '<span class="muted">Очищаю озвучки…</span>';
+      const r = await api("/api/stories/" + enc(current) + "/voice/clean", {});
+      if (r.failed.length) alert("Очистить не удалось: " + r.failed.map((f) => f.name + " — " + f.error).join("\\n"));
+    }
+    await openStory(current, true);
+  } catch (e) { alert(e.message); await openStory(current, true); }
+}
+
+async function recleanVoices() {
+  try {
+    const box = $("#micBox"); if (box) box.innerHTML = '<span class="muted">Пересчитываю очистку…</span>';
+    const r = await api("/api/stories/" + enc(current) + "/voice/clean", { force: true });
+    if (r.failed.length) alert("Очистить не удалось: " + r.failed.map((f) => f.name + " — " + f.error).join("\\n"));
+    await openStory(current, true);
+  } catch (e) { alert(e.message); await openStory(current, true); }
+}
+
+async function setMute(on) {
+  try { await api("/api/stories/" + enc(current) + "/settings", { muteVideo: on }); await openStory(current, true); } catch (e) { alert(e.message); }
+}
+
+async function micFillDevices(unlock) {
+  const sel = $("#micDev"); if (!sel || !navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+  if (unlock) {
+    // названия микрофонов браузер выдаёт только после разрешения: берём доступ на мгновение
+    try { (await navigator.mediaDevices.getUserMedia({ audio: true })).getTracks().forEach((t) => t.stop()); }
+    catch (e) { alert("Нет доступа к микрофону: " + e.message); }
+  }
+  const all = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "audioinput");
+  const list = all.filter((d) => d.deviceId && d.deviceId !== "default" && d.deviceId !== "communications");
+  const saved = localStorage.getItem("rm.mic") || "";
+  sel.innerHTML = '<option value="">Микрофон по умолчанию</option>' +
+    list.map((d, i) => '<option value="' + esc(d.deviceId) + '">' + esc(d.label || "Микрофон " + (i + 1)) + "</option>").join("");
+  if (list.some((d) => d.deviceId === saved)) sel.value = saved;
+  const hint = $("#micDevHint"); if (hint) hint.style.display = all.some((d) => d.label) ? "none" : "";
+}
+
+function micRender() {
+  const box = $("#micBox"); if (!box) return;
+  const m = window.curMontage || { voices: [], sources: [], sound: "talk", mute: false };
+  if (mic.st === "rec" || mic.st === "send") {
+    if (mic.story !== current) { box.innerHTML = '<span class="muted">Идёт запись в сюжете «' + esc(mic.story) + "» — вернитесь к нему, чтобы остановить.</span>"; return; }
+    box.innerHTML = mic.st === "send" ? '<span class="muted">Сохраняю запись…</span>'
+      : '<div class="row"><span class="rec-dot"></span><b id="micT">0:00</b><span class="lv"><i id="micLv"></i></span><b id="micHint" style="font-size:18px"></b>' +
+        '<button onclick="micStop()">Остановить и сохранить</button><button class="sec" onclick="micCancel()">Отмена</button>' +
+        '<span class="muted">' + (mic.mode === "pcm" ? "запись без потерь" : "запись со сжатием") + " · новая озвучка добавится к прежним</span></div>";
+    micTick();
+    return;
+  }
+  const player = (label, src) => '<div style="display:flex;gap:6px;align-items:center"><span class="muted" style="width:62px;font-size:12px">' + label + '</span><audio class="voice" controls preload="none" src="' + src + "?" + Date.now() + '"></audio></div>';
+  const takes = m.voices.map((v, i) => {
+    const base = v.name.slice(0, v.name.lastIndexOf(".")) + ".wav";
+    const audio = isAudioName(v.name);
+    const cleanTxt = v.clean === "ready" ? '<span class="ok">чистая ✓</span>' : v.clean === "stale" ? '<span class="warn">очистка не готова</span>' : '<span class="muted">очистка выкл.</span>';
+    return '<tr><td><span class="tag">' + esc(v.letter) + "</span></td><td>" + esc(v.name) + "</td><td>" + (v.duration == null ? "—" : sec(v.duration)) + "</td><td>" +
+      (v.transcribed ? (v.fresh ? '<span class="ok">расшифрована</span>' : '<span class="warn">расшифровка устарела</span>') : '<span class="muted">не расшифрована</span>') + "<br>" + cleanTxt + "</td><td>" +
+      (audio ? player("оригинал", "/in/" + enc(current) + "/" + enc(v.name)) + (v.clean === "ready" ? player("чистая", "/in/" + enc(current) + "/.rm/clean/" + enc(base)) : "") : "") + "</td><td>" +
+      (audio ? '<button class="sec" onclick="voiceDel(' + i + ')" title="Убрать эту запись: монтажёр её больше не увидит">Удалить</button>' : "") + "</td></tr>";
+  }).join("");
+  const sound = m.sound === "voice" ? "звук роликов — только озвучки (" + m.voices.length + "), монтажёр сам выберет лучший дубль каждой фразы"
+    : m.sound === "none" ? "звук роликов: без звука, пока нет озвучки" : "звук роликов — с основы";
+  box.innerHTML = '<div class="row"><button onclick="micStart()" title="Записать озвучку с микрофона">' + MIC_SVG + " Записать озвучку</button>" +
+    '<label>Микрофон <select id="micDev" onchange="localStorage.setItem(&quot;rm.mic&quot;, this.value)" style="max-width:260px"><option value="">Микрофон по умолчанию</option></select></label>' +
+    '<a href="#" id="micDevHint" onclick="micFillDevices(true);return false" style="color:var(--acc);font-size:12px">показать названия</a>' +
+    '<label title="Обработка браузера убирает фоновый шум, но может «булькать» голос; для лучшего качества — выкл."><input type="checkbox" id="micNs"' + (localStorage.getItem("rm.micNs") === "1" ? " checked" : "") +
+    ' onchange="localStorage.setItem(&quot;rm.micNs&quot;, this.checked ? &quot;1&quot; : &quot;0&quot;)"> шумоподавление</label></div>' +
+    '<div class="row" style="margin-top:8px"><label><input type="checkbox" id="muteChk"' + (m.mute ? " checked" : "") + ' onchange="setMute(this.checked)"> Звук видео не использовать</label>' +
+    '<span class="muted">' + sound + ". Каждая запись — новый файл, прежние не затираются.</span></div>" +
+    '<div class="row" style="margin-top:8px"><label><input type="checkbox" id="cleanChk"' + (m.voiceClean ? " checked" : "") + ' onchange="setClean(this.checked)"> Очищать озвучку</label>' +
+    '<span class="muted">убирает писк USB-микрофона (гребёнка помех), шумоподавление по тишине в начале записи, гейт; оригинал не меняется — в роликах звук из чистой копии</span>' +
+    (m.voiceClean && m.voices.length ? ' <a href="#" onclick="recleanVoices();return false" style="color:var(--acc);font-size:12px">пересчитать</a>' : "") + "</div>" +
+    (takes ? '<table style="margin-top:8px"><tr><th></th><th>озвучка</th><th>длит.</th><th>расшифровка</th><th></th><th></th></tr>' + takes + "</table>" : "");
+  micFillDevices(false).catch(() => {});
+}
+if (navigator.mediaDevices) navigator.mediaDevices.ondevicechange = () => { if (mic.st === "idle") micFillDevices(false).catch(() => {}); };
+
+function micTick() {
+  const t = $("#micT"); if (!t || mic.st !== "rec") return;
+  const sec = Math.floor((Date.now() - mic.t0) / 1000);
+  t.textContent = Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0");
+  // первые 1,5 с — тишина: по ней очистка настраивается на шум именно этой записи
+  const hint = $("#micHint");
+  if (hint) {
+    const quiet = Date.now() - mic.t0 < 1500;
+    hint.textContent = quiet ? "● ЗАМЕР ШУМА — МОЛЧИТЕ…" : "● ГОВОРИТЕ";
+    hint.style.color = quiet ? "var(--warn)" : "var(--ok)";
+  }
+  const lv = $("#micLv");
+  if (lv && mic.an) {
+    mic.an.getByteTimeDomainData(mic.buf);
+    let sum = 0; for (const b of mic.buf) sum += ((b - 128) / 128) ** 2;
+    lv.style.width = Math.min(100, Math.sqrt(sum / mic.buf.length) * 400) + "%";
+  }
+}
+
+function micRelease() {
+  clearInterval(mic.timer); mic.timer = null;
+  if (mic.node) { try { mic.node.disconnect(); } catch {} }
+  if (mic.stream) mic.stream.getTracks().forEach((t) => t.stop());
+  if (mic.ctx) mic.ctx.close().catch(() => {});
+  mic.stream = null; mic.ctx = null; mic.node = null; mic.an = null;
+  window.onbeforeunload = null;
+}
+
+async function micStart() {
+  if (mic.st !== "idle") return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { alert("Это окно не умеет записывать звук"); return; }
+  const dev = $("#micDev") ? $("#micDev").value : "";
+  const audio = { channelCount: { ideal: 1 }, echoCancellation: false, noiseSuppression: $("#micNs") ? $("#micNs").checked : false, autoGainControl: false };
+  try {
+    try {
+      mic.stream = await navigator.mediaDevices.getUserMedia({ audio: dev ? { ...audio, deviceId: { exact: dev } } : audio });
+    } catch (e) {
+      if (!dev || e.name !== "OverconstrainedError") throw e;
+      // выбранный микрофон отключили — пишем с микрофона по умолчанию
+      localStorage.removeItem("rm.mic");
+      mic.stream = await navigator.mediaDevices.getUserMedia({ audio });
+    }
+  } catch (e) {
+    alert("Нет доступа к микрофону: " + e.message + ". Разрешите микрофон для этого окна (значок слева от адреса) и повторите.");
+    return;
+  }
+  mic.chunks = []; mic.mode = "pcm"; mic.ext = "wav";
+  // название микрофона: по нему сервер хранит образец шума этого микрофона (запасной для записей без тишины)
+  mic.label = (mic.stream.getAudioTracks()[0] || {}).label || "";
+  try {
+    // без потерь: отсчёты прямо с входа, сжатия нет
+    try { mic.ctx = new AudioContext({ sampleRate: 48000 }); } catch { mic.ctx = new AudioContext(); }
+    mic.rate = mic.ctx.sampleRate;
+    const src = mic.ctx.createMediaStreamSource(mic.stream);
+    mic.an = mic.ctx.createAnalyser(); mic.an.fftSize = 1024; mic.buf = new Uint8Array(mic.an.fftSize);
+    src.connect(mic.an);
+    const url = URL.createObjectURL(new Blob([MIC_WORKLET], { type: "text/javascript" }));
+    await mic.ctx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+    mic.node = new AudioWorkletNode(mic.ctx, "rm-rec", { numberOfInputs: 1, numberOfOutputs: 1, channelCount: 1, channelCountMode: "explicit" });
+    mic.node.port.onmessage = (e) => { if (e.data !== "done") mic.chunks.push(e.data); };
+    // выход глушим: узел должен быть подключён к выходу, иначе браузер его не вызывает
+    const mute = mic.ctx.createGain(); mute.gain.value = 0;
+    src.connect(mic.node); mic.node.connect(mute); mute.connect(mic.ctx.destination);
+  } catch (e) {
+    // нет AudioWorklet — запасной путь: сжатая запись браузера с максимальным битрейтом
+    if (mic.ctx) mic.ctx.close().catch(() => {});
+    mic.ctx = null; mic.node = null; mic.an = null; mic.mode = "mr";
+    const mime = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"].find((x) => MediaRecorder.isTypeSupported(x)) || "";
+    mic.rec = new MediaRecorder(mic.stream, mime ? { mimeType: mime, audioBitsPerSecond: 256000 } : { audioBitsPerSecond: 256000 });
+    mic.ext = /ogg/.test(mic.rec.mimeType) ? "ogg" : /mp4/.test(mic.rec.mimeType) ? "mp4" : "webm";
+    mic.rec.ondataavailable = (ev) => { if (ev.data && ev.data.size) mic.chunks.push(ev.data); };
+    mic.rec.start(1000);
+  }
+  mic.story = current; mic.st = "rec"; mic.t0 = Date.now();
+  mic.timer = setInterval(micTick, 150);
+  window.onbeforeunload = () => "Идёт запись озвучки";
+  micRender();
+}
+
+function micCancel() {
+  if (mic.st !== "rec") return;
+  if (mic.rec) { mic.rec.onstop = null; mic.rec.ondataavailable = null; try { mic.rec.stop(); } catch {} mic.rec = null; }
+  micRelease(); mic.chunks = []; mic.st = "idle"; micRender();
+}
+
+async function micStop() {
+  if (mic.st !== "rec") return;
+  const story = mic.story;
+  let blob;
+  if (mic.mode === "pcm") {
+    // дослать остаток буфера процессора, потом собрать wav
+    await new Promise((ok) => { const t = setTimeout(ok, 500); mic.node.port.onmessage = (e) => { if (e.data === "done") { clearTimeout(t); ok(); } else mic.chunks.push(e.data); }; mic.node.port.postMessage("flush"); });
+    blob = micWav(mic.chunks, mic.rate);
+  } else {
+    const rec = mic.rec; mic.rec = null;
+    const stopped = new Promise((ok) => { rec.onstop = ok; });
+    rec.stop();
+    await stopped;
+    blob = new Blob(mic.chunks, { type: rec.mimeType || "audio/webm" });
+  }
+  micRelease();
+  mic.chunks = []; mic.st = "send"; micRender();
+  try {
+    if (blob.size < 4096) throw new Error("запись пустая — проверьте микрофон");
+    const r = await fetch("/api/stories/" + enc(story) + "/voice?ext=" + mic.ext + (mic.label ? "&mic=" + enc(mic.label) : ""), { method: "POST", headers: { "content-type": blob.type || "application/octet-stream" }, body: blob });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    mic.st = "idle";
+    if (j.cleanMode === "track") alert("Очистка сработала в слабом режиме: в начале записи не нашлось тишины, а образца этого микрофона ещё нет.\\nВ следующий раз после нажатия «Записать» помолчите 1,5 секунды — по этой тишине очистка настраивается.");
+    if (j.cleanError) alert("Запись сохранена, но очистить её не удалось — в роликах будет оригинал:\\n" + j.cleanError);
+    if (current !== story) return;
+    // новая озвучка нужна с текстом: расшифровка стартует сама; без неё просто обновить страницу
+    if (state.stt) await transcribe(false); else await openStory(story, true);
+  } catch (e) {
+    mic.st = "idle"; micRender(); alert(e.message);
+  }
 }
 
 async function showGrid(i) {

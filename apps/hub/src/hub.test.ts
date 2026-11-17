@@ -6,7 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { loadPresets, PRESETS_DIR, type RenderVariantParams } from "@reels-factory/render";
+import { scanMontage } from "@reels-factory/pc-agent";
+import { editToPlans, splitReplicas } from "@reels-factory/render";
 import { buildStory, listRuns, runIdFor, type BuildEnv } from "./build.ts";
+import { montageInput, montageScenes } from "./montage.ts";
 import { createJobQueue } from "./jobs.ts";
 import { createHub, safeJoin } from "./server.ts";
 
@@ -353,4 +356,265 @@ test("HTTP: оформление из интерфейса — шрифт, ра�
     cleanup();
     rmSync(dataDir, { recursive: true, force: true });
   }
+});
+
+test("HTTP, озвучка с микрофона: записи копятся (каждая — новый файл и новая озвучка), аудио без кадров и кропа, слова по файлу", async () => {
+  const { env, cleanup } = setup();
+  const dir = join(env.inboxDir, "челси");
+  mkdirSync(dir, { recursive: true });
+  for (const f of ["голова.mp4", "дальний.mp4"]) writeFileSync(join(dir, f), "x");
+  const converted: string[] = [];
+  const { server } = createHub({
+    ...env,
+    hw: "cpu",
+    concurrency: 1,
+    hooks: { probe: async (_p: string, file: string) => ({ duration: 8, hasAudio: !file.endsWith("голова.mp4"), width: file.endsWith(".wav") ? null : 1080, height: file.endsWith(".wav") ? null : 1920 }) },
+    // вместо ffmpeg: «перекодированный» файл — те же байты записи
+    // очистка без настоящего ffmpeg: «тишина» на входе, «чистый звук» на выходе
+    cleanDeps: {
+      decode: async () => ({ samples: new Float32Array(16000 * 4), rate: 16000 }),
+      run: async (_c: string, args: string[]) => {
+        writeFileSync(args[args.length - 1]!, "чистый звук");
+        return { ok: true, stderr: "" };
+      },
+    },
+    convertAudio: async (src, dst) => {
+      // ffmpeg не умеет писать поверх своего входа: запись, пришедшая уже в wav, перекодируется в другой файл
+      assert.notEqual(src, dst);
+      converted.push(src.split(/[\\/]/).pop()!);
+      writeFileSync(dst, readFileSync(src));
+    },
+    openFolder: () => {},
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const root = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const base = `${root}/api/stories/${encodeURIComponent("челси")}`;
+  const post = (path: string, body: unknown) => fetch(base + path, { method: "POST", body: JSON.stringify(body) });
+  const upload = (bytes: number, ext = "webm") => fetch(`${base}/voice?ext=${ext}`, { method: "POST", headers: { "content-type": "audio/webm" }, body: Buffer.alloc(bytes, 7) });
+  const names = (m: { voices: { name: string }[] }) => m.voices.map((v) => v.name);
+  try {
+    let m = await json(fetch(base + "/montage"));
+    assert.deepEqual(m.voices, []);
+    assert.equal(m.sound, "none", "у основы нет звука, озвучки нет — ролики без звука");
+    assert.match(m.problems.join("\n"), /у основы нет звука — ролики соберутся без звука/);
+
+    assert.equal((await upload(100)).status, 400, "пустая запись");
+    assert.equal((await upload(4096, "../x")).status, 400, "расширение — только буквы и цифры");
+    assert.deepEqual(await json(upload(4096)), { name: "озвучка.wav", clean: true, cleanMode: "profile" });
+    assert.deepEqual(converted, ["voice-upload.webm"]);
+    assert.ok(existsSync(join(dir, "озвучка.wav")));
+    assert.deepEqual(await readdirNames(join(dir, ".rm")), ["clean"], "временных файлов нет, осталась только папка чистых копий");
+    assert.deepEqual((await readdirNames(join(dir, ".rm", "clean"))).sort(), ["озвучка.json", "озвучка.wav"], "в ней нет временных файлов");
+    m = await json(fetch(base + "/montage"));
+    assert.deepEqual(names(m), ["озвучка.wav"]);
+    assert.equal(m.voices[0].letter, "a");
+    assert.equal(m.sound, "voice");
+    assert.equal(m.roles.voice, "озвучка.wav");
+    assert.equal(m.voices[0].transcribed, false);
+    assert.doesNotMatch(m.problems.join("\n"), /у основы нет звука/);
+    assert.match(m.problems.join("\n"), /озвучка «озвучка\.wav» ещё не расшифрована/);
+
+    // вторая запись не затирает первую: обе остаются озвучками, буквы стабильны
+    assert.deepEqual(await json(upload(2048)), { name: "озвучка 2.wav", clean: true, cleanMode: "profile" });
+    assert.deepEqual(await json(upload(2048, "wav")), { name: "озвучка 3.wav", clean: true, cleanMode: "profile" }, "запись в wav (так шлёт страница) — тоже");
+    assert.ok(existsSync(join(dir, "озвучка.wav")) && existsSync(join(dir, "озвучка 2.wav")));
+    m = await json(fetch(base + "/montage"));
+    assert.deepEqual(names(m), ["озвучка.wav", "озвучка 2.wav", "озвучка 3.wav"]);
+    assert.deepEqual(m.voices.map((v: { letter: string }) => v.letter), ["a", "b", "c"]);
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, "story.json"), "utf8")).sources.voice, ["озвучка.wav", "озвучка 2.wav", "озвучка 3.wav"]);
+
+    // метка микрофона записи (её шлёт страница) хранится в story.json по имени файла: по ней очистка находит образец шума микрофона
+    const withMic = await json(fetch(`${base}/voice?ext=wav&mic=${encodeURIComponent("Микрофон (2- C-1U)")}`, { method: "POST", headers: { "content-type": "audio/wav" }, body: Buffer.alloc(2048, 3) }));
+    assert.equal(withMic.name, "озвучка 4.wav");
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, "story.json"), "utf8")).voiceMic, { "озвучка 4.wav": "Микрофон (2- C-1U)" });
+    await json(post("/voice/delete", { name: "озвучка 4.wav" }));
+    // очистка: у каждой записи есть чистая копия в .rm/clean, оригинал не тронут, в ролик пойдёт чистая
+    assert.ok(existsSync(join(dir, ".rm", "clean", "озвучка.wav")) && existsSync(join(dir, ".rm", "clean", "озвучка.json")));
+    assert.equal(readFileSync(join(dir, "озвучка.wav")).length, 4096, "оригинал не изменён");
+    assert.deepEqual(m.voices.map((v: { clean: string }) => v.clean), ["ready", "ready", "ready"]);
+    assert.equal(m.voiceClean, true);
+    const scanned = await scanMontage(dir, "челси", { ffprobePath: "ffprobe", probe: async () => ({ duration: 8, hasAudio: true, width: null, height: null }) });
+    assert.match(montageInput(scanned, []).voices![0]!.file.replace(/\\/g, "/"), /\/\.rm\/clean\/озвучка\.wav$/, "звук роликов — из чистой копии");
+    assert.equal((await fetch(`${root}/in/${encodeURIComponent("челси")}/.rm/clean/${encodeURIComponent("озвучка.wav")}`)).status, 200, "чистую копию можно прослушать");
+    assert.equal((await fetch(`${root}/in/${encodeURIComponent("челси")}/.rm/clean/${encodeURIComponent("озвучка.json")}`)).status, 404, "отдаётся только аудио");
+    // изменили оригинал — копия устарела и пересчитывается
+    writeFileSync(join(dir, "озвучка 3.wav"), Buffer.alloc(3000, 9));
+    assert.equal((await json(fetch(base + "/montage"))).voices[2].clean, "stale");
+    assert.deepEqual((await json(post("/voice/clean", {}))).done, ["озвучка 3.wav"], "пересчитана только устаревшая");
+    assert.deepEqual((await json(post("/voice/clean", { force: true }))).done.length, 3, "force — все");
+    // выключили очистку: звук роликов — оригиналы
+    assert.deepEqual(await json(post("/settings", { voiceClean: false })), { count: null, voiceClean: false });
+    m = await json(fetch(base + "/montage"));
+    assert.deepEqual(m.voices.map((v: { clean: string }) => v.clean), ["off", "off", "off"]);
+    assert.equal((await post("/voice/clean", {})).status, 409);
+    const off = await scanMontage(dir, "челси", { ffprobePath: "ffprobe", probe: async () => ({ duration: 8, hasAudio: true, width: null, height: null }) });
+    assert.match(montageInput(off, []).voices![0]!.file.replace(/\\/g, "/"), /челси\/озвучка\.wav$/, "без очистки — оригинал");
+    assert.equal((await post("/settings", { voiceClean: "да" })).status, 400);
+    assert.deepEqual(await json(post("/settings", { voiceClean: true })), { count: null, voiceClean: true });
+    assert.equal(JSON.parse(readFileSync(join(dir, "story.json"), "utf8")).voiceClean, undefined);
+
+    // прослушивание на странице; только аудио
+    const got = await fetch(`${root}/in/${encodeURIComponent("челси")}/${encodeURIComponent("озвучка.wav")}`);
+    assert.equal(got.status, 200);
+    assert.equal(got.headers.get("content-type"), "audio/wav");
+    assert.equal((await fetch(`${root}/in/${encodeURIComponent("челси")}/${encodeURIComponent("story.json")}`)).status, 404);
+
+    // у аудио нет кадров и кропа; в основу, дальний и экран аудиофайл не назначить
+    assert.equal((await post("/frames", { source: "voice", grid: 2 })).status, 400);
+    assert.equal((await post("/crop", { source: "озвучка.wav", crop: null })).status, 400);
+    assert.equal((await post("/roles", { talk: "озвучка.wav" })).status, 400);
+
+    // слова: озвучек несколько — нужен файл; озвучка не расшифрована — 409
+    assert.equal((await fetch(base + "/words?from=0&to=5")).status, 400);
+    assert.equal((await fetch(base + "/words?from=0&to=5&file=" + encodeURIComponent("озвучка 2"))).status, 409);
+    writeFileSync(join(dir, "озвучка 2.transcript.json"), JSON.stringify({ text: "", words: [{ text: "Привет.", start: 0.3, end: 0.8 }, { text: "Пока.", start: 2, end: 2.5 }] }));
+    m = await json(fetch(base + "/montage"));
+    assert.deepEqual(m.voiceReplicas.map((r: { id: string; source: string }) => [r.id, r.source]), [["b01", "озвучка 2.wav"], ["b02", "озвучка 2.wav"]]);
+    const w = await json(fetch(base + "/words?from=0&to=1&file=" + encodeURIComponent("озвучка 2.wav")));
+    assert.equal(w.file, "озвучка 2.wav");
+    assert.deepEqual(w.words.map((x: { text: string }) => x.text), ["Привет."]);
+
+    // лист по репликам озвучки (файл — по букве реплики); «replica» при озвучке — ошибка
+    writeFileSync(join(dir, "edit.json"), JSON.stringify({ version: 1, variants: [{ id: "a", segments: [{ voice: "b01", note: "приветствие, вид из окна" }, { voice: "b02", view: "wide", wideAt: 1 }] }] }));
+    const ok = await json(post("/check", {}));
+    assert.deepEqual(ok.errors, []);
+    assert.equal(ok.variants[0].label, "b01 → b02 дальний");
+    // план по сценам для страницы: время в ролике, реплика, картинка, подпись монтажёра или текст реплики
+    const [sc1, sc2] = ok.variants[0].scenes;
+    assert.deepEqual([sc1.id, sc1.visual, sc1.note, sc1.text, sc1.from], ["b01", "вид", "приветствие, вид из окна", "Привет.", 0]);
+    assert.deepEqual([sc2.id, sc2.visual, sc2.note, sc2.text], ["b02", "дальний", "", "Пока."]);
+    assert.ok(Math.abs(sc2.from - sc1.to) < 0.11 && sc2.to > sc2.from);
+    const bad = await json(post("/check", { edit: { version: 1, variants: [{ id: "x", segments: [{ replica: "r01" }] }] } }));
+    assert.match(bad.errors[0], /укажите "voice"/);
+
+    // роли: озвучки массивом; «—» — отказ, звук снова не с озвучек
+    assert.deepEqual((await json(post("/roles", { voice: ["озвучка 3.wav", "озвучка.wav"] }))).roles.voice, ["озвучка 3.wav", "озвучка.wav"]);
+    assert.deepEqual(names(await json(fetch(base + "/montage"))), ["озвучка 3.wav", "озвучка.wav"], "порядок задаёт владелец");
+    assert.equal((await post("/roles", { voice: ["нет.wav"] })).status, 400);
+    assert.equal((await json(post("/roles", { voice: "" }))).roles.voice, "");
+    m = await json(fetch(base + "/montage"));
+    assert.deepEqual(m.voices, []);
+    assert.equal(m.sound, "none");
+
+    // звук видео: настройка хранится в story.json
+    assert.equal((await post("/settings", { muteVideo: "да" })).status, 400);
+    assert.deepEqual(await json(post("/settings", { muteVideo: true })), { count: null, muteVideo: true });
+    assert.equal((await json(fetch(base + "/montage"))).mute, true);
+    assert.equal(JSON.parse(readFileSync(join(dir, "story.json"), "utf8")).muteVideo, true);
+    assert.deepEqual(await json(post("/settings", { muteVideo: false })), { count: null, muteVideo: false });
+    assert.equal(JSON.parse(readFileSync(join(dir, "story.json"), "utf8")).muteVideo, undefined);
+  } finally {
+    server.close();
+    cleanup();
+  }
+});
+
+test("HTTP, удаление озвучки: файл уходит в .rm/trash, буквы остальных не сдвигаются и не выдаются заново, видео не удаляется", async () => {
+  const { env, cleanup } = setup();
+  const dir = join(env.inboxDir, "челси");
+  mkdirSync(dir, { recursive: true });
+  for (const f of ["голова.mp4", "дальний.mp4", "диктофон.mp4"]) writeFileSync(join(dir, f), "x");
+  const { server } = createHub({
+    ...env,
+    hw: "cpu",
+    concurrency: 1,
+    hooks: { probe: async (_p: string, file: string) => ({ duration: 8, hasAudio: !file.endsWith("голова.mp4"), width: file.endsWith(".wav") ? null : 1080, height: file.endsWith(".wav") ? null : 1920 }) },
+    // очистка без настоящего ffmpeg: «тишина» на входе, «чистый звук» на выходе
+    cleanDeps: {
+      decode: async () => ({ samples: new Float32Array(16000 * 4), rate: 16000 }),
+      run: async (_c: string, args: string[]) => {
+        writeFileSync(args[args.length - 1]!, "чистый звук");
+        return { ok: true, stderr: "" };
+      },
+    },
+    convertAudio: async (src, dst) => writeFileSync(dst, readFileSync(src)),
+    openFolder: () => {},
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/stories/${encodeURIComponent("челси")}`;
+  const post = (path: string, body: unknown) => fetch(base + path, { method: "POST", body: JSON.stringify(body) });
+  const upload = () => json(fetch(`${base}/voice?ext=wav`, { method: "POST", headers: { "content-type": "audio/wav" }, body: Buffer.alloc(4096, 5) }));
+  const letters = async () => Object.fromEntries((await json(fetch(base + "/montage"))).voices.map((v: { name: string; letter: string }) => [v.name, v.letter]));
+  try {
+    for (let i = 0; i < 3; i++) await upload();
+    writeFileSync(join(dir, "озвучка 2.transcript.json"), JSON.stringify({ text: "", words: [{ text: "Кривой", start: 0.2, end: 0.6 }] }));
+    assert.deepEqual(await letters(), { "озвучка.wav": "a", "озвучка 2.wav": "b", "озвучка 3.wav": "c" });
+
+    // нельзя: нет такой озвучки; не озвучка (видео основы); видео, назначенное озвучкой
+    assert.equal((await post("/voice/delete", { name: "нет.wav" })).status, 404);
+    assert.equal((await post("/voice/delete", { name: "голова.mp4" })).status, 404, "основа — не озвучка");
+    await json(post("/roles", { voice: ["озвучка.wav", "озвучка 2.wav", "озвучка 3.wav", "диктофон.mp4"] }));
+    const vid = await post("/voice/delete", { name: "диктофон.mp4" });
+    assert.equal(vid.status, 400);
+    assert.match(((await vid.json()) as { error: string }).error, /не аудиофайл/);
+    assert.ok(existsSync(join(dir, "диктофон.mp4")), "видео на месте");
+    await json(post("/roles", { voice: ["озвучка.wav", "озвучка 2.wav", "озвучка 3.wav"] }));
+
+    // удаляем средний дубль (b): файл и расшифровка — в корзину, не стираются
+    const del = await json(post("/voice/delete", { name: "озвучка 2.wav" }));
+    assert.deepEqual([del.deleted, del.letter, del.left], ["озвучка 2.wav", "b", ["озвучка.wav", "озвучка 3.wav"]]);
+    assert.ok(!existsSync(join(dir, "озвучка 2.wav")) && !existsSync(join(dir, "озвучка 2.transcript.json")));
+    const trash = await readdirNames(join(dir, ".rm", "trash"));
+    assert.equal(trash.length, 4, "запись, расшифровка, чистая копия и её описание");
+    assert.ok(trash.some((f) => f.endsWith("_озвучка 2.wav")) && trash.some((f) => f.endsWith("_озвучка 2.transcript.json")));
+    assert.ok(trash.some((f) => f.endsWith("_чистая_озвучка 2.wav")) && trash.some((f) => f.endsWith("_чистая_озвучка 2.json")));
+    assert.ok(!existsSync(join(dir, ".rm", "clean", "озвучка 2.wav")), "чистая копия ушла вместе с записью");
+    assert.deepEqual(await letters(), { "озвучка.wav": "a", "озвучка 3.wav": "c" }, "c остаётся c — ссылки в листе не едут");
+
+    // новая запись не наследует ни имя, ни букву удалённой
+    assert.deepEqual(await upload(), { name: "озвучка 4.wav", clean: true, cleanMode: "profile" });
+    assert.deepEqual(await letters(), { "озвучка.wav": "a", "озвучка 3.wav": "c", "озвучка 4.wav": "d" });
+    const meta = JSON.parse(readFileSync(join(dir, "story.json"), "utf8"));
+    assert.equal(meta.voiceLetters["озвучка 2.wav"], "b", "буква удалённой остаётся занятой");
+
+    // удалили все — озвучек нет, звук роликов снова по правилам основы
+    for (const n of ["озвучка.wav", "озвучка 3.wav", "озвучка 4.wav"]) assert.equal((await post("/voice/delete", { name: n })).status, 200);
+    const m = await json(fetch(base + "/montage"));
+    assert.deepEqual(m.voices, []);
+    assert.equal(m.sound, "none");
+    assert.equal(JSON.parse(readFileSync(join(dir, "story.json"), "utf8")).sources.voice, undefined);
+    assert.equal((await readdirNames(join(dir, ".rm", "trash"))).filter((f) => f.endsWith(".wav") && !f.includes("_чистая_")).length, 4, "все четыре записи целы в корзине");
+  } finally {
+    server.close();
+    cleanup();
+  }
+});
+
+test("HTTP, озвучка: сюжет из сценок NN_… записи не принимает", async () => {
+  const { env, cleanup } = setup();
+  const { server } = createHub({ ...env, hw: "cpu", concurrency: 1, hooks: { probe }, convertAudio: async () => {}, openFolder: () => {} });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const r = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/api/stories/${encodeURIComponent("кофе")}/voice?ext=webm`, { method: "POST", body: Buffer.alloc(4096, 1) });
+    assert.equal(r.status, 409);
+  } finally {
+    server.close();
+    cleanup();
+  }
+});
+
+async function readdirNames(dir: string): Promise<string[]> {
+  const { readdir } = await import("node:fs/promises");
+  return readdir(dir);
+}
+
+test("план по сценам: сегмент start/end получает id и текст перекрытых реплик озвучки", () => {
+  const w = (text: string, start: number, end: number) => ({ text, start, end });
+  const tr = { text: "", words: [w("Первая.", 0.5, 1.2), w("Вторая", 3, 3.5), w("фраза.", 3.5, 4.2), w("Третья.", 6, 6.8)] };
+  const voiceReplicas = splitReplicas(tr, 9, { prefix: "k" }).map((r) => ({ ...r, source: "озвучка.wav" }));
+  assert.equal(voiceReplicas.length, 3);
+  const input = {
+    storyId: "s",
+    talk: { name: "голова.mp4", file: "C:/s/голова.mp4", duration: 30, transcript: null },
+    replicas: [],
+    voices: [{ name: "озвучка.wav", file: "C:/s/.rm/clean/озвучка.wav", duration: 9, transcript: tr }],
+    voiceReplicas,
+    presets: ["default"],
+  };
+  const edit = { version: 1 as const, variants: [{ id: "a", segments: [{ start: 0.3, end: 4.4, note: "k01 + k02" }, { start: 5.9, end: 7, view: "wide" as const }] }] };
+  const res = editToPlans(edit, { ...input, wide: { name: "дальний.mp4", file: "C:/s/дальний.mp4", duration: 20 } });
+  assert.deepEqual(res.errors, []);
+  const [a, b] = montageScenes(res.plans[0]!, edit.variants[0]!, voiceReplicas, "C:/s/голова.mp4");
+  assert.deepEqual([a!.id, a!.text, a!.note, a!.visual], ["k01 + k02", "Первая. Вторая фраза.", "k01 + k02", "вид"], "реплики по перекрытию, подпись монтажёра — отдельно");
+  assert.deepEqual([b!.id, b!.text, b!.visual], ["k03", "Третья.", "дальний"]);
 });

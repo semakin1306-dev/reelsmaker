@@ -213,3 +213,107 @@ test("исходники: роли по именам и из story.json, реп�
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("озвучка: аудиофайлы — роль voice, несколько дублей с буквами a, b…, реплики с source; основа без звука не ошибка; отказ \"\" не подбирает файл", async () => {
+  const { guessRole, needsTranscription, scanMontage, soundMode, transcribeSound, writeMeta } = await import("./montage.ts");
+  const { AUDIO_RE } = await import("./probe.ts");
+  assert.equal(guessRole("озвучка.wav"), "voice");
+  assert.equal(guessRole("запись 1.m4a"), "voice", "любой аудиофайл — озвучка");
+  assert.equal(guessRole("голова.mp4"), "talk");
+  assert.ok(AUDIO_RE.test("x.WAV") && !AUDIO_RE.test("x.mp4"));
+  // ffprobe: аудио без видео годится только когда просят
+  const audioOnly = JSON.stringify({ format: { duration: "7.5" }, streams: [{ codec_type: "audio" }] });
+  assert.equal(parseProbe(audioOnly), null);
+  assert.deepEqual(parseProbe(audioOnly, true), { duration: 7.5, hasAudio: true, width: null, height: null });
+
+  const dir = tmp("rf-voice-");
+  try {
+    for (const f of ["челси.mp4", "дальний.mp4", "озвучка.wav", "озвучка 2.wav"]) writeFileSync(join(dir, f), "x");
+    const probe = async (_p: string, file: string) =>
+      file.endsWith(".wav") ? { duration: 8, hasAudio: true, width: null, height: null } : { duration: 30, hasAudio: false, width: 1080, height: 1920 };
+    const opts = { ffprobePath: "ffprobe", probe };
+    await writeMeta(dir, { sources: { talk: "челси.mp4" } });
+    let m = await scanMontage(dir, "s", opts);
+    assert.equal(m.roles.talk?.name, "челси.mp4");
+    // оба аудиофайла — озвучки без роли в story.json; буква — по порядку файлов
+    assert.equal(m.voices.length, 2);
+    assert.deepEqual(m.voices.map((v) => v.letter), ["a", "b"]);
+    assert.equal(soundMode(m), "voice");
+    assert.ok(!m.problems.some((p) => /нет звука/.test(p)), "основа без звука при озвучке — не проблема");
+    assert.equal(m.problems.filter((p) => /озвучка «.+» ещё не расшифрована/.test(p)).length, 2);
+    assert.equal(needsTranscription(m), true);
+    assert.deepEqual(m.voiceReplicas, []);
+
+    // расшифровка: все озвучки одним запуском модели, основа без звука не расшифровывается
+    const asked: string[][] = [];
+    const run: SttRun = async (_c, args) => {
+      const files = args.slice(9);
+      asked.push(files);
+      return {
+        code: 0,
+        timedOut: false,
+        stderr: "",
+        stdout: files
+          .map((f) => JSON.stringify({ file: f, ok: true, transcript: { text: "а", words: [{ text: "Новый", start: 0.3, end: 0.7 }, { text: "голос.", start: 0.7, end: 1.2 }, { text: "Дальше", start: 3, end: 3.5 }] } }))
+          .join("\n"),
+      };
+    };
+    assert.equal(await transcribeSound(m, { stt: { python: "p", model: "m" }, run }), true);
+    assert.equal(asked.length, 1, "модель поднимается один раз");
+    assert.deepEqual(asked[0]!.map((f) => f.split(/[\\/]/).pop()), ["озвучка 2.wav", "озвучка.wav"].sort((x, y) => m.voices.findIndex((v) => v.src.name === x) - m.voices.findIndex((v) => v.src.name === y)));
+    m = await scanMontage(dir, "s", opts);
+    const [first, second] = m.voices;
+    assert.deepEqual(first!.replicas.map((r) => r.id), ["a01", "a02"]);
+    assert.deepEqual(second!.replicas.map((r) => r.id), ["b01", "b02"], "у второго файла своя буква — id не пересекаются");
+    assert.ok(m.voiceReplicas.every((r) => r.source === (r.id.startsWith("a") ? first!.src.name : second!.src.name)), "реплика знает свой файл");
+    assert.equal(needsTranscription(m), false);
+    assert.equal(await transcribeSound(m, { stt: { python: "p", model: "m" }, run }), false, "свежие расшифровки не повторяются");
+
+    // новый файл: расшифровывается только он
+    writeFileSync(join(dir, "озвучка 3.wav"), "x");
+    m = await scanMontage(dir, "s", opts);
+    assert.equal(needsTranscription(m), true);
+    asked.length = 0;
+    await transcribeSound(m, { stt: { python: "p", model: "m" }, run });
+    assert.deepEqual(asked[0]!.map((f) => f.split(/[\\/]/).pop()), ["озвучка 3.wav"]);
+
+    // заданные в story.json — только они и в заданном порядке (буквы стабильны)
+    await writeMeta(dir, { sources: { talk: "челси.mp4", voice: ["озвучка 3.wav", "озвучка.wav"] } });
+    m = await scanMontage(dir, "s", opts);
+    assert.deepEqual(m.voices.map((v) => [v.letter, v.src.name]), [["a", "озвучка 3.wav"], ["b", "озвучка.wav"]]);
+
+    // основа без звука и без озвучки: звука нет, расшифровывать нечего, проблема названа
+    await writeMeta(dir, { sources: { talk: "челси.mp4", voice: "" } });
+    m = await scanMontage(dir, "s", opts);
+    assert.equal(m.voices.length, 0, "voice: \"\" — отказ от озвучки");
+    assert.equal(soundMode(m), "none");
+    assert.ok(m.problems.some((p) => /у основы нет звука — ролики соберутся без звука/.test(p)));
+    assert.equal(needsTranscription(m), false);
+    await assert.rejects(transcribeSound(m, { stt: { python: "p", model: "m" }, run }), /нечего расшифровывать/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("звук видео отключён (story.json → muteVideo): основа со звуком не расшифровывается и не используется", async () => {
+  const { needsTranscription, scanMontage, soundMode, writeMeta } = await import("./montage.ts");
+  const dir = tmp("rf-mute-");
+  try {
+    for (const f of ["голова.mp4", "дальний.mp4"]) writeFileSync(join(dir, f), "x");
+    const probe = async () => ({ duration: 30, hasAudio: true, width: 1080, height: 1920 });
+    const opts = { ffprobePath: "ffprobe", probe };
+    let m = await scanMontage(dir, "s", opts);
+    assert.equal(m.mute, false);
+    assert.equal(soundMode(m), "talk");
+    assert.equal(needsTranscription(m), true);
+    assert.ok(m.problems.some((p) => /основа ещё не расшифрована/.test(p)));
+    await writeMeta(dir, { muteVideo: true });
+    m = await scanMontage(dir, "s", opts);
+    assert.equal(m.mute, true);
+    assert.equal(soundMode(m), "none");
+    assert.equal(needsTranscription(m), false, "звук не нужен — расшифровка тоже");
+    assert.ok(!m.problems.some((p) => /основа ещё не расшифрована/.test(p)));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -1,14 +1,18 @@
 // Монтаж из исходников: одно видео со звуком (основа, крупный план) режется на реплики; варианты собираются из реплик
 // по монтажному листу (edit.json), который пишет агент-монтажёр. Перебивки — дальним планом, вставки — скринкастом.
-// Звук и субтитры всегда с основы. Оформление (пресет, цвет, скорость, высота звука, зум) — как у обычных вариантов:
+// Звук и субтитры с основы — или, если в сюжете есть озвучка (отдельные аудиофайлы, дублей может быть несколько), с неё:
+// каждый файл режется на свои реплики (a01…, b01…, по букве на файл), а картинка (крупный, дальний, экран) берётся
+// из видео как обычно. Владелец может отключить звук видео совсем (mute): тогда ролик без звука, пока не пришла озвучка. Оформление (пресет, цвет, скорость, высота звука, зум) — как у обычных вариантов:
 // задано в листе — берётся оттуда, нет — раздаётся по вариантам автоматически, чтобы варианты различались.
 import { hashSeed } from "./rng.ts";
 import { capitalize, hookFromTranscript } from "./planner/rules.ts";
 import { DEFAULT_OUTPUT, SAFE_BOX, type Box, type Crop, type ClipInput, type PlanBlock, type PlanScene, type Transcript, type VariantPlan } from "./types.ts";
 
 export interface Replica {
-  /** r01, r02… по порядку в основе */
+  /** r01, r02… по порядку в основе; у озвучки — буква файла и номер: a01, b01… */
   id: string;
+  /** озвучка: имя файла, из которого реплика (у реплик основы нет) */
+  source?: string;
   start: number;
   end: number;
   text: string;
@@ -20,6 +24,8 @@ export interface ReplicaOptions {
   /** запас до первого и после последнего слова, с */
   padBefore?: number;
   padAfter?: number;
+  /** буква номера реплики: r (основа), a (озвучка) */
+  prefix?: string;
 }
 
 /** Режет расшифровку основы на реплики: по концу предложения или паузе. Границы не залезают на соседей. */
@@ -52,7 +58,7 @@ export function splitReplicas(transcript: Transcript, duration: number, opts: Re
     const start = Math.max(prevMid, first.start - padBefore, 0);
     const end = Math.min(nextMid, last.end + padAfter, duration);
     return {
-      id: `r${String(i + 1).padStart(2, "0")}`,
+      id: `${opts.prefix ?? "r"}${String(i + 1).padStart(2, "0")}`,
       start: Math.round(start * 1000) / 1000,
       end: Math.round(Math.max(end, start + 0.1) * 1000) / 1000,
       text: g.map((w) => w.text.trim()).join(" "),
@@ -67,8 +73,15 @@ export type View = "close" | "wide";
 export interface EditSegment {
   /** реплика основы; или явный отрезок start/end основы */
   replica?: string;
+  /** реплика озвучки (a01, b03…) — когда в сюжете есть озвучка: звук и длина сегмента берутся из неё */
+  voice?: string;
+  /** озвучка: файл для start/end, когда озвучек несколько (имя, можно без расширения) */
+  voiceFile?: string;
+  /** явный отрезок источника звука (основы или озвучки), с */
   start?: number;
   end?: number;
+  /** озвучка: с какой секунды основы показывать крупный план; нет — та же секунда, что у звука, + layout.talkOffset */
+  at?: number;
   /** подрезать реплику: + к началу, − к концу (с) */
   cutStart?: number;
   cutEnd?: number;
@@ -80,6 +93,8 @@ export interface EditSegment {
   screen?: number | true;
   /** какой скринкаст вставить (имя файла, можно без расширения); нужен, когда скринкастов несколько */
   screenFile?: string;
+  /** подпись сцены для владельца: что говорится и что на экране; на сборку не влияет, показывается на странице в плане варианта */
+  note?: string;
 }
 
 export interface EditBlock {
@@ -112,6 +127,8 @@ export interface EditLayout {
   /** сдвиг дальнего плана относительно основы, с (если сняты одновременно, но запущены не разом) */
   wideOffset?: number;
   screenOffset?: number;
+  /** сдвиг крупного плана относительно озвучки, с (только при озвучке) */
+  talkOffset?: number;
 }
 
 export interface EditList {
@@ -155,6 +172,12 @@ export interface MontageInput {
   /** все скринкасты сюжета; сегмент выбирает свой по screenFile */
   screens?: MontageSource[] | null;
   replicas: Replica[];
+  /** озвучка: отдельные аудиофайлы (дубли) — источник звука и субтитров вместо основы */
+  voices?: (MontageSource & { transcript: Transcript | null })[];
+  /** реплики всех озвучек (у каждой source — файл) */
+  voiceReplicas?: Replica[];
+  /** звук видео отключён: без озвучки ролик получается без звука и без субтитров */
+  mute?: boolean;
   /** id всех пресетов — для раздачи по вариантам */
   presets: readonly string[];
 }
@@ -174,9 +197,40 @@ export function fitSafe(b: Box): Box {
 /** Единственный пресет оформления (решение владельца: шрифты и цвет одинаковые у всех вариантов). */
 export const DEFAULT_PRESET = "default";
 
+/** Кадр держится меньше — картинка «скачет», смотреть тяжело (жалоба владельца на ролики с частой сменой). */
+export const MIN_SHOT = 2.5;
+
+/**
+ * «Кадр» — подряд идущие сцены с одной и той же картинкой без скачка: скринкаст продолжает себя с того же места,
+ * фон идёт дальше. Разрез звука посреди кадра (вырезанная пауза) кадром не считается.
+ */
+export function shotsOf(scenes: readonly PlanScene[]): { from: number; to: number; len: number }[] {
+  const shots: { from: number; to: number; len: number }[] = [];
+  const EPS = 0.15;
+  scenes.forEach((s, i) => {
+    const len = s.trim.end - s.trim.start;
+    const prev = i > 0 ? scenes[i - 1]! : null;
+    let same = false;
+    if (prev) {
+      const pl = prev.trim.end - prev.trim.start;
+      const screen = (prev.inset?.file ?? null) === (s.inset?.file ?? null) && (!s.inset || Math.abs(s.inset.start - (prev.inset!.start + pl)) <= EPS);
+      // фон: своя картинка (picture) должна продолжаться; без неё картинка — сам отрезок основы
+      const pic = (prev.picture?.file ?? prev.file) === (s.picture?.file ?? s.file) &&
+        (s.picture && prev.picture ? Math.abs(s.picture.start - (prev.picture.start + pl)) <= EPS : !s.picture && !prev.picture ? Math.abs(s.trim.start - prev.trim.end) <= EPS : false);
+      same = screen && pic;
+    }
+    if (same) {
+      const last = shots[shots.length - 1]!;
+      last.to = i;
+      last.len += len;
+    } else shots.push({ from: i, to: i, len });
+  });
+  return shots;
+}
+
 export interface MontageResult {
   plans: VariantPlan[];
-  /** файлы для словаря клипов рендера: основа (с расшифровкой — для субтитров) */
+  /** файлы для словаря клипов рендера: источник звука (основа или озвучка) с расшифровкой — для субтитров */
   clips: Map<string, ClipInput>;
   errors: string[];
   warnings: string[];
@@ -189,7 +243,19 @@ export function editToPlans(edit: EditList, input: MontageInput): MontageResult 
   const errors: string[] = [];
   const warnings: string[] = [];
   const plans: VariantPlan[] = [];
-  const byId = new Map(input.replicas.map((r) => [r.id, r]));
+  const voices = input.voices ?? [];
+  const voiced = voices.length > 0;
+  /** звук видео отключён и озвучки нет: ролик без звука */
+  const mute = !voiced && input.mute === true;
+  // с озвучкой реплики — её (a01, b01…): звук и субтитры берутся из неё, а видео даёт только картинку
+  const byId = new Map((voiced ? (input.voiceReplicas ?? []) : input.replicas).map((r) => [r.id, r]));
+  const normName = (x: string) => x.toLowerCase().replace(/\.[^.]+$/, "").trim();
+  const voiceNames = voices.map((x) => x.name).join(", ");
+  /** озвучка по имени файла (можно без расширения); без имени — единственная */
+  const pickVoice = (name: string | undefined) => {
+    if (!name) return voices.length === 1 ? voices[0]! : null;
+    return voices.find((x) => x.name === name) ?? voices.find((x) => normName(x.name) === normName(name)) ?? null;
+  };
   const layout: EditLayout = { ...(edit.layout ?? {}) };
   for (const k of ["wideScreenBox", "closeScreenBox"] as const) {
     const b = layout[k];
@@ -201,9 +267,13 @@ export function editToPlans(edit: EditList, input: MontageInput): MontageResult 
     }
   }
   const talk = input.talk;
-  const clips = new Map<string, ClipInput>([
-    [talk.name, { id: talk.name, file: talk.file, duration: talk.duration, hasAudio: true, transcript: talk.transcript ?? undefined }],
-  ]);
+  const clips = new Map<string, ClipInput>();
+  if (voiced) {
+    for (const x of voices) clips.set(x.name, { id: x.name, file: x.file, duration: x.duration, hasAudio: true, transcript: x.transcript ?? undefined });
+  } else {
+    clips.set(talk.name, { id: talk.name, file: talk.file, duration: talk.duration, hasAudio: !mute, transcript: mute ? undefined : (talk.transcript ?? undefined) });
+    if (mute) warnings.push("звук видео отключён, озвучки нет — ролики соберутся без звука и без субтитров (запишите озвучку или положите аудиофайл в папку сюжета)");
+  }
   if (!Array.isArray(edit.variants) || edit.variants.length === 0) errors.push("в листе нет вариантов (variants)");
   const screens = input.screens?.length ? input.screens : input.screen ? [input.screen] : [];
   const screenNames = screens.map((x) => x.name).join(", ");
@@ -231,23 +301,44 @@ export function editToPlans(edit: EditList, input: MontageInput): MontageResult 
       const at = `${where}, сегмент ${si}`;
       let start: number;
       let end: number;
-      if (sg.replica !== undefined) {
-        const rep = byId.get(sg.replica);
+      if (voiced && sg.replica !== undefined) {
+        errors.push(`${at}: в сюжете есть озвучка — звук берётся из неё, укажите "voice": "a01" (реплики основы r.. не используются)`);
+        return;
+      }
+      if (!voiced && sg.voice !== undefined) {
+        errors.push(`${at}: voice «${sg.voice}», а озвучки в сюжете нет`);
+        return;
+      }
+      // источник звука сегмента: файл озвучки (по реплике или по voiceFile) либо основа
+      let sound: MontageSource = talk;
+      const ref = voiced ? sg.voice : sg.replica;
+      if (ref !== undefined) {
+        const rep = byId.get(ref);
         if (!rep) {
-          errors.push(`${at}: нет реплики ${sg.replica}`);
+          errors.push(`${at}: нет реплики ${ref}`);
           return;
         }
+        if (voiced) sound = pickVoice(rep.source) ?? voices[0]!;
         start = rep.start + (sg.cutStart ?? 0);
         end = rep.end - (sg.cutEnd ?? 0);
       } else if (typeof sg.start === "number" && typeof sg.end === "number") {
+        if (voiced) {
+          const vf = pickVoice(sg.voiceFile);
+          if (!vf) {
+            errors.push(`${at}: ${sg.voiceFile ? `нет озвучки «${sg.voiceFile}»` : "озвучек несколько — укажите voiceFile"} (есть: ${voiceNames})`);
+            return;
+          }
+          sound = vf;
+        }
         start = sg.start;
         end = sg.end;
       } else {
-        errors.push(`${at}: нужна replica или start/end`);
+        errors.push(`${at}: нужна ${voiced ? "voice" : "replica"} или start/end`);
         return;
       }
+      if (sg.voiceFile !== undefined && !voiced) warnings.push(`${at}: voiceFile без озвучки в сюжете — не используется`);
       start = Math.max(0, start);
-      end = Math.min(talk.duration, end);
+      end = Math.min(sound.duration, end);
       const len = end - start;
       if (len < 0.3) {
         errors.push(`${at}: отрезок короче 0,3 с (${round3(start)}–${round3(end)})`);
@@ -256,18 +347,29 @@ export function editToPlans(edit: EditList, input: MontageInput): MontageResult 
       const view: View = sg.view ?? "close";
       if (view !== "close" && view !== "wide") errors.push(`${at}: view — close или wide`);
       const scene: PlanScene = {
-        clipId: talk.name,
-        file: talk.file,
+        clipId: sound.name,
+        file: sound.file,
         scene: si + 1,
         take: "",
         role: si === 0 ? "hook" : si === v.segments.length - 1 ? "final" : "body",
-        duration: talk.duration,
-        hasAudio: true,
+        duration: sound.duration,
+        hasAudio: voiced || !mute,
         trim: { start: round3(start), end: round3(end) },
-        ...(talk.crop ? { crop: talk.crop } : {}),
+        ...(!voiced && talk.crop ? { crop: talk.crop } : {}),
         // без зума и дрейфа: кадр ровно как выбран кропом
         zoom: { factor: 1, drift: 0 },
       };
+      if (sg.at !== undefined && !voiced) warnings.push(`${at}: at работает только при озвучке — крупный план без озвучки идёт со звуком основы`);
+      if (voiced && view === "close") {
+        // крупный план при озвучке — тоже «картинка из другого файла»: звук с озвучки, картинка с основы
+        const want = sg.at ?? start + (layout.talkOffset ?? 0);
+        const maxStart = Math.max(0, talk.duration - len);
+        if (!Number.isFinite(want) || want < 0) errors.push(`${at}: at ${String(sg.at)} — секунда основы, от 0`);
+        else {
+          if (want > talk.duration - 0.1) warnings.push(`${at}: основа длиной ${round3(talk.duration)} с, взято с ${round3(Math.min(want, maxStart))} с`);
+          scene.picture = { file: talk.file, start: round3(Math.min(want, maxStart)), ...(talk.crop ? { crop: talk.crop } : {}) };
+        }
+      }
       if (view === "wide") {
         if (!input.wide) errors.push(`${at}: перебивка дальним планом, а дальнего плана в сюжете нет`);
         else {
@@ -296,6 +398,11 @@ export function editToPlans(edit: EditList, input: MontageInput): MontageResult 
       scenes.push(scene);
     });
     if (scenes.length !== v.segments.length) return;
+    for (const sh of shotsOf(scenes)) {
+      if (sh.len < MIN_SHOT - 0.05) {
+        warnings.push(`${where}: кадр держится ${sh.len.toFixed(1).replace(".", ",")} с (${sh.from === sh.to ? `сцена ${sh.from + 1}` : `сцены ${sh.from + 1}–${sh.to + 1}`}) — короче ${String(MIN_SHOT).replace(".", ",")} с, картинка будет скакать; объедините с соседней или удлините`);
+      }
+    }
 
     const blocks: PlanBlock[] = [];
     for (const b of v.blocks ?? []) {
@@ -309,7 +416,8 @@ export function editToPlans(edit: EditList, input: MontageInput): MontageResult 
     if (extra.length) warnings.push(`${where}: ${extra.join(", ")} в листе не используются — оформление, темп и голос одни на все варианты`);
     const firstText = (() => {
       const s0 = v.segments[0]!;
-      const rep = s0.replica ? byId.get(s0.replica) : null;
+      const first = voiced ? s0.voice : s0.replica;
+      const rep = first ? byId.get(first) : null;
       return rep ? hookFromTranscript(rep.text) : null;
     })();
     plans.push({
@@ -330,7 +438,7 @@ export function editToPlans(edit: EditList, input: MontageInput): MontageResult 
   const openings = new Map<string, string[]>();
   for (const p of plans) {
     const s = p.scenes[0]!;
-    const key = `${p.hook.text}|${s.trim.start}|${s.picture ? "wide" : "close"}`;
+    const key = `${p.hook.text}|${s.trim.start}|${s.picture ? s.picture.file : "close"}|${s.picture ? s.picture.start : ""}`;
     openings.set(key, [...(openings.get(key) ?? []), String(p.index)]);
   }
   for (const [, same] of openings) {

@@ -8,6 +8,9 @@ export interface ClipProbe {
   height: number | null;
 }
 
+/** Аудиофайлы озвучки (запись с микрофона сохраняется как wav). */
+export const AUDIO_RE = /\.(wav|mp3|m4a|aac|ogg|oga|opus|flac|wma)$/i;
+
 export type ProbeRun = (cmd: string, args: string[]) => Promise<{ ok: boolean; stdout: string; stderr: string }>;
 
 const defaultRun: ProbeRun = (cmd, args) => coreRun(cmd, args, { timeout: 30_000 });
@@ -27,8 +30,8 @@ function rotation(s: ProbeStream): number {
   return Number.isFinite(r) ? r : 0;
 }
 
-/** Разбирает JSON ffprobe (-show_format -show_streams). Нет длительности — null. */
-export function parseProbe(json: string): ClipProbe | null {
+/** Разбирает JSON ffprobe (-show_format -show_streams). Нет длительности — null; аудио без видео — только если audioOnly. */
+export function parseProbe(json: string, audioOnly = false): ClipProbe | null {
   let data: { format?: { duration?: string }; streams?: ProbeStream[] };
   try {
     data = JSON.parse(json);
@@ -37,8 +40,9 @@ export function parseProbe(json: string): ClipProbe | null {
   }
   const streams = data.streams ?? [];
   const video = streams.find((s) => s.codec_type === "video");
-  const duration = Number(data.format?.duration ?? video?.duration);
-  if (!video || !Number.isFinite(duration) || duration <= 0) return null;
+  const duration = Number(data.format?.duration ?? video?.duration ?? streams.find((s) => s.codec_type === "audio")?.duration);
+  if (!Number.isFinite(duration) || duration <= 0) return null;
+  if (!video) return audioOnly && streams.some((s) => s.codec_type === "audio") ? { duration, hasAudio: true, width: null, height: null } : null;
   return {
     duration,
     hasAudio: streams.some((s) => s.codec_type === "audio"),
@@ -57,5 +61,5 @@ export async function probeClip(ffprobePath: string, file: string, run: ProbeRun
     "-of", "json",
     file,
   ]);
-  return res.ok ? parseProbe(res.stdout) : null;
+  return res.ok ? parseProbe(res.stdout, AUDIO_RE.test(file)) : null;
 }

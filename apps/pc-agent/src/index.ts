@@ -51,3 +51,5 @@ export async function transcribeStory(
   return { scan: await scanStory(dir, id, opts), done, failed };
 }
 export * from "./montage.ts";
+export * from "./voice-clean.ts";
+export * from "./mic-clean.ts";

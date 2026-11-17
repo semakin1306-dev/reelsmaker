@@ -12,7 +12,7 @@ import {
   type VariantPlan,
   type ClipInput,
 } from "@reels-factory/render";
-import { probeClip, scanStory, toStoryInput, transcribeStory, needsTranscript, type SttConfig, type StoryScan } from "@reels-factory/pc-agent";
+import { probeClip, scanStory, toStoryInput, transcribeStory, needsTranscript, type CleanDeps, type SttConfig, type StoryScan } from "@reels-factory/pc-agent";
 
 export interface BuildEnv {
   inboxDir: string;
@@ -74,6 +74,8 @@ export interface BuildHooks {
   transcribe?: typeof transcribeStory;
   /** подмена ffprobe (тесты) */
   probe?: typeof probeClip;
+  /** подмена декодера и запуска ffmpeg при очистке озвучки (тесты) */
+  cleanDeps?: Omit<CleanDeps, "ffmpegPath">;
   now?: () => Date;
 }
 

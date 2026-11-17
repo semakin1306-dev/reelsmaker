@@ -8,3 +8,7 @@ data/
 *.log
 .claude/settings.local.json
 local-start.bat
+
+# Python
+__pycache__/
+*.pyc

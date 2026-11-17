@@ -1,23 +1,34 @@
 // Локальный интерфейс ReelsMaker: слушает только 127.0.0.1. Без внешних зависимостей (node:http).
-import { createReadStream, readFileSync } from "node:fs";
-import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream, readFileSync } from "node:fs";
+import { mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { once } from "node:events";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
 import { extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { run as coreRun } from "@reels-factory/core";
 import {
+  AUDIO_RE,
+  cleanedFiles,
+  defaultNoiseDir,
+  ensureClean,
   grabFrame,
   isSafeName,
+  nextVoiceLetter,
   listStoryDirs,
   readMeta,
   scanMontage,
   scanStory,
+  soundMode,
   transcribeStory,
-  transcribeTalk,
+  transcribeSound,
   writeMeta,
   SOURCE_ROLES,
+  SOURCE_RE,
   VIDEO_RE,
+  VOICE_BASE,
   WORK_DIR,
+  type CleanDeps,
   type MontageScan,
   type SourceRole,
 } from "@reels-factory/pc-agent";
@@ -26,7 +37,7 @@ import { applyStyle, cleanStyle, layerView, LAYERS, readStyle, writeStyle, type 
 import { buildStory, listRuns, type BuildEnv, type BuildHooks } from "./build.ts";
 import { createAgentHub, MODELS, type AgentHub } from "./agent.ts";
 import { editorPrompt } from "./editor-prompt.ts";
-import { buildMontage, checkEdit, montageLabel, storyKind } from "./montage.ts";
+import { buildMontage, checkEdit, montageLabel, montageScenes, storyKind } from "./montage.ts";
 import { createJobQueue, type JobQueue } from "./jobs.ts";
 import { PAGE_HTML } from "./page.ts";
 
@@ -36,6 +47,10 @@ export interface HubOptions extends BuildEnv {
   concurrency: number;
   /** для тестов: подмена рендера и расшифровки */
   hooks?: Pick<BuildHooks, "renderVariant" | "transcribe" | "probe">;
+  /** подмена декодера и запуска ffmpeg при очистке озвучки (тесты) */
+  cleanDeps?: Omit<CleanDeps, "ffmpegPath">;
+  /** перекодировать запись озвучки в wav; по умолчанию ffmpeg (подмена — тесты) */
+  convertAudio?: (src: string, dst: string) => Promise<void>;
   /** открыть папку в проводнике; по умолчанию explorer.exe */
   openFolder?: (path: string) => void;
   /** адрес интерфейса — агенту для команды rm */
@@ -64,6 +79,14 @@ const TYPES: Record<string, string> = {
   ".svg": "image/svg+xml",
   ".ttf": "font/ttf",
   ".otf": "font/otf",
+  ".wav": "audio/wav",
+  ".mp3": "audio/mpeg",
+  ".m4a": "audio/mp4",
+  ".aac": "audio/aac",
+  ".ogg": "audio/ogg",
+  ".oga": "audio/ogg",
+  ".opus": "audio/ogg",
+  ".flac": "audio/flac",
 };
 
 class HttpError extends Error {
@@ -107,6 +130,25 @@ async function readJson(req: IncomingMessage, limit = 64 * 1024): Promise<Record
   } catch {
     throw new HttpError(400, "тело запроса — не JSON");
   }
+}
+
+/** Тело запроса — в файл, без накопления в памяти; больше limit байт — 413. */
+async function saveBody(req: IncomingMessage, file: string, limit: number): Promise<number> {
+  const ws = createWriteStream(file);
+  let size = 0;
+  try {
+    for await (const c of req) {
+      size += (c as Buffer).length;
+      if (size > limit) throw new HttpError(413, "запись слишком большая");
+      if (!ws.write(c as Buffer)) await once(ws, "drain");
+    }
+    await new Promise<void>((ok, fail) => ws.end((e?: Error | null) => (e ? fail(e) : ok())));
+  } catch (e) {
+    ws.destroy();
+    await rm(file, { force: true });
+    throw e;
+  }
+  return size;
 }
 
 /** Отдаёт файл; для видео — с Range, чтобы в плеере работала перемотка. */
@@ -245,10 +287,37 @@ export function createHub(opts: HubOptions): { server: Server; jobs: JobQueue; a
     transcribed: m.transcript !== null,
     transcriptFresh: m.transcriptFresh,
     replicas: m.replicas,
+    /** озвучки по порядку: буква — префикс id реплик (a01, b01…) */
+    voices: m.voices.map((v) => ({
+      name: v.src.name,
+      letter: v.letter,
+      transcribed: v.transcript !== null,
+      fresh: v.fresh,
+      replicas: v.replicas.length,
+      duration: v.src.probe?.duration ?? null,
+      /** ready — звук роликов берётся из чистой копии; stale — копию ещё надо сделать; off — очистка выключена */
+      clean: v.clean,
+    })),
+    /** очистка озвучки включена (по умолчанию да) */
+    voiceClean: m.cleanOn,
+    voiceReplicas: m.voiceReplicas,
+    /** звук видео отключён владельцем */
+    mute: m.mute,
+    /** откуда звук в роликах: voice (озвучки), talk (основа) или none (без звука) */
+    sound: soundMode(m),
     edit: m.edit,
     editError: m.editError,
     problems: m.problems,
   });
+  const convertAudio =
+    opts.convertAudio ??
+    (async (src: string, dst: string) => {
+      const r = await coreRun(opts.ffmpegPath, ["-hide_banner", "-loglevel", "error", "-y", "-i", src, "-vn", "-ar", "48000", "-c:a", "pcm_s24le", dst], {
+        timeout: 5 * 60_000,
+      });
+      if (!r.ok) throw new Error(`ffmpeg не прочитал запись: ${r.stderr.trim().split(/\r?\n/).pop() ?? "ошибка"}`);
+    });
+  const cleanDeps = (): CleanDeps => ({ ffmpegPath: opts.ffmpegPath, noiseDir: defaultNoiseDir(opts.inboxDir), ...opts.cleanDeps });
   const openFolder =
     opts.openFolder ?? ((path: string) => spawn("explorer.exe", [path], { detached: true, stdio: "ignore", windowsHide: false }).unref());
 
@@ -271,6 +340,16 @@ export function createHub(opts: HubOptions): { server: Server; jobs: JobQueue; a
     }
     // кадры для агента и страницы: /in/<сюжет>/.rm/frames/<файл>
     if (method === "GET" && parts[0] === "in" && parts[2] === WORK_DIR && parts[3] === "frames" && parts.length === 5) {
+      await sendFile(req, res, safeJoin(opts.inboxDir, parts.slice(1)));
+      return;
+    }
+    // чистая копия озвучки для прослушивания: /in/<сюжет>/.rm/clean/<файл>.wav
+    if (method === "GET" && parts[0] === "in" && parts[2] === WORK_DIR && parts[3] === "clean" && parts.length === 5 && AUDIO_RE.test(parts[4]!)) {
+      await sendFile(req, res, safeJoin(opts.inboxDir, parts.slice(1)));
+      return;
+    }
+    // озвучка сюжета для прослушивания на странице: /in/<сюжет>/<файл-аудио>
+    if (method === "GET" && parts[0] === "in" && parts.length === 3 && AUDIO_RE.test(parts[2]!)) {
       await sendFile(req, res, safeJoin(opts.inboxDir, parts.slice(1)));
       return;
     }
@@ -384,15 +463,26 @@ export function createHub(opts: HubOptions): { server: Server; jobs: JobQueue; a
       sendJson(res, 200, montageView(await scanMontage(join(opts.inboxDir, id), id, scanOpts)));
       return;
     }
-    // GET /api/stories/:id/words?from=&to= — слова основы со временем, чтобы резать внутри реплики
+    // GET /api/stories/:id/words?from=&to=&file= — слова источника звука со временем, чтобы резать внутри реплики.
+    // Озвучки несколько — file обязателен (имя, можно без расширения); озвучки нет — слова основы.
     if (method === "GET" && parts[1] === "stories" && parts[3] === "words") {
       const id = await requireStory(parts[2]!);
       const m = await scanMontage(join(opts.inboxDir, id), id, scanOpts);
-      if (!m.transcript) throw new HttpError(409, "основа ещё не расшифрована");
+      let transcript = m.transcript;
+      let file = m.roles.talk?.name ?? "";
+      if (m.voices.length) {
+        const want = url.searchParams.get("file");
+        const norm = (x: string) => x.toLowerCase().replace(/\.[^.]+$/, "").trim();
+        const take = want ? m.voices.find((v) => v.src.name === want || norm(v.src.name) === norm(want)) : m.voices.length === 1 ? m.voices[0] : undefined;
+        if (!take) throw new HttpError(400, `${want ? `нет озвучки «${want}»` : "озвучек несколько — укажите файл"} (есть: ${m.voices.map((v) => v.src.name).join(", ")})`);
+        transcript = take.transcript;
+        file = take.src.name;
+        if (!transcript) throw new HttpError(409, `озвучка «${file}» ещё не расшифрована`);
+      } else if (!transcript) throw new HttpError(409, "основа ещё не расшифрована");
       const num = (k: string, d: number) => (url.searchParams.has(k) && Number.isFinite(Number(url.searchParams.get(k))) ? Number(url.searchParams.get(k)) : d);
       const from = num("from", -Infinity);
       const to = num("to", Infinity);
-      sendJson(res, 200, { words: m.transcript.words.filter((w) => w.end >= from && w.start <= to) });
+      sendJson(res, 200, { file, words: transcript!.words.filter((w) => w.end >= from && w.start <= to) });
       return;
     }
     // POST /api/stories/:id/frames {source: роль|файл, times?: [], grid?: N, width?, full?} — кадры с кропом (full — весь кадр)
@@ -404,6 +494,7 @@ export function createHub(opts: HubOptions): { server: Server; jobs: JobQueue; a
       const want = String(body["source"] ?? "");
       const src = m.roles[want as SourceRole] ?? m.sources.find((s) => s.name === want);
       if (!src) throw new HttpError(404, `нет исходника «${want}» (роли: ${SOURCE_ROLES.join(", ")}; файлы: ${m.sources.map((s) => s.name).join(", ")})`);
+      if (AUDIO_RE.test(src.name) || src.role === "voice") throw new HttpError(400, `«${src.name}» — звук, кадров у него нет`);
       const dur = src.probe?.duration ?? 0;
       const grid = intIn(body["grid"], 0, 24, 0);
       const times =
@@ -426,28 +517,128 @@ export function createHub(opts: HubOptions): { server: Server; jobs: JobQueue; a
       sendJson(res, 200, { source: src.name, role: src.role, frames });
       return;
     }
-    // POST /api/stories/:id/roles {talk, wide, screen}
+    // POST /api/stories/:id/roles {talk, wide, screen, voice}
     if (method === "POST" && parts[1] === "stories" && parts[3] === "roles") {
       const id = await requireStory(parts[2]!);
       const dir = join(opts.inboxDir, id);
       const body = await readJson(req);
-      const names = (await readdir(dir)).filter((f) => VIDEO_RE.test(f));
+      const names = (await readdir(dir)).filter((f) => SOURCE_RE.test(f));
       const meta = await readMeta(dir);
       const sources = { ...meta.sources };
       for (const role of SOURCE_ROLES) {
         if (!(role in body)) continue;
         const v = body[role];
-        // скринкастов может быть несколько: массив имён; основа и дальний — одно имя
-        const list = (Array.isArray(v) && role === "screen" ? v : [v]).filter((x) => x !== null && x !== "");
-        for (const x of list) if (typeof x !== "string" || !names.includes(x)) throw new HttpError(400, `${role}: нет видео «${String(x)}» в папке сюжета`);
-        if (list.length === 0) delete sources[role];
-        else sources[role] = list.length === 1 ? (list[0] as string) : (list as string[]);
+        // скринкастов и озвучек может быть несколько: массив имён; основа и дальний — одно имя
+        const list = (Array.isArray(v) && (role === "screen" || role === "voice") ? v : [v]).filter((x) => x !== null && x !== "");
+        for (const x of list) {
+          if (typeof x !== "string" || !names.includes(x)) throw new HttpError(400, `${role}: нет файла «${String(x)}» в папке сюжета`);
+          if (role !== "voice" && AUDIO_RE.test(x)) throw new HttpError(400, `${role}: «${x}» — аудиофайл, у него нет картинки (его место — озвучка)`);
+        }
+        // «—» у озвучки — явный отказ (звук снова с основы): "" не даёт подобрать аудиофайл по расширению
+        if (list.length === 0) {
+          if (role === "voice") sources.voice = "";
+          else delete sources[role];
+        } else sources[role] = list.length === 1 ? (list[0] as string) : (list as string[]);
       }
       await writeMeta(dir, { ...meta, sources });
       sendJson(res, 200, { roles: sources });
       return;
     }
-    // POST /api/stories/:id/settings {count} — сколько вариантов нужно в итоге (null — не задано)
+    // POST /api/stories/:id/voice — запись с микрофона (тело — аудио как есть, ?ext=wav|webm|ogg|mp4): в wav 48 кГц 24 бит
+    // в папку сюжета, новая озвучка добавляется к прежним
+    if (method === "POST" && parts[1] === "stories" && parts[3] === "voice" && parts.length === 4) {
+      const id = await requireStory(parts[2]!);
+      const dir = join(opts.inboxDir, id);
+      if ((await storyKind(dir)) !== "montage") throw new HttpError(409, "озвучка — только для сюжета из исходников (основа, дальний, скринкаст)");
+      const mic = (url.searchParams.get("mic") ?? "").trim().slice(0, 120);
+      const ext = (url.searchParams.get("ext") ?? "webm").toLowerCase();
+      if (!/^[a-z0-9]{2,5}$/.test(ext)) throw new HttpError(400, "ext: расширение записи (webm, ogg, mp4, wav)");
+      const work = join(dir, WORK_DIR);
+      await mkdir(work, { recursive: true });
+      const raw = join(work, `voice-upload.${ext}`);
+      // результат перекодирования — другой файл, даже когда запись пришла уже в wav (иначе ffmpeg пишет поверх входа)
+      const tmp = join(work, "voice-converted.wav");
+      let name = `${VOICE_BASE}.wav`;
+      try {
+        const size = await saveBody(req, raw, 500 * 1024 * 1024);
+        if (size < 1024) throw new HttpError(400, "запись пустая");
+        try {
+          await convertAudio(raw, tmp);
+        } catch (e) {
+          throw new HttpError(422, (e as Error).message);
+        }
+        // каждая запись — новый файл: прежние дубли не затираются и остаются озвучками сюжета
+        const before = (await scanMontage(dir, id, scanOpts)).voices;
+        const meta = await readMeta(dir);
+        // буквы закрепляются за файлами; имена удалённых дублей тоже заняты — новая запись не наследует чужую букву
+        const letters: Record<string, string> = { ...meta.voiceLetters, ...Object.fromEntries(before.map((v) => [v.src.name, v.letter])) };
+        const taken = new Set([...(await readdir(dir)), ...Object.keys(letters)].map((f) => f.toLowerCase()));
+        for (let n = 2; taken.has(name.toLowerCase()); n++) name = `${VOICE_BASE} ${n}.wav`;
+        await rename(tmp, join(dir, name));
+        letters[name] = nextVoiceLetter(Object.values(letters));
+        await writeMeta(dir, {
+          ...meta,
+          voiceLetters: letters,
+          ...(mic ? { voiceMic: { ...meta.voiceMic, [name]: mic } } : {}),
+          sources: { ...meta.sources, voice: [...before.map((v) => v.src.name), name] },
+        });
+      } finally {
+        await rm(raw, { force: true });
+        await rm(tmp, { force: true });
+      }
+      // новая запись сразу получает чистую копию (если очистка включена); сбой очистки запись не отменяет — остаётся оригинал
+      const after = await scanMontage(dir, id, scanOpts);
+      const cleaned = after.cleanOn ? await ensureClean({ ...after, voices: after.voices.filter((v) => v.src.name === name) }, cleanDeps()) : null;
+      sendJson(res, 200, {
+        name,
+        ...(cleaned?.done.length ? { clean: true, cleanMode: cleaned.modes[name] } : {}),
+        ...(cleaned?.failed.length ? { cleanError: cleaned.failed[0]!.error } : {}),
+      });
+      return;
+    }
+    // POST /api/stories/:id/voice/clean {force?} — сделать недостающие чистые копии озвучек (force — пересчитать все)
+    if (method === "POST" && parts[1] === "stories" && parts[3] === "voice" && parts[4] === "clean") {
+      const id = await requireStory(parts[2]!);
+      const dir = join(opts.inboxDir, id);
+      const body = await readJson(req);
+      const m = await scanMontage(dir, id, scanOpts);
+      if (!m.cleanOn) throw new HttpError(409, "очистка озвучки выключена в настройках сюжета");
+      const r = await ensureClean(m, cleanDeps(), { force: body["force"] === true });
+      sendJson(res, 200, r);
+      return;
+    }
+    // POST /api/stories/:id/voice/delete {name} — убрать озвучку из сюжета: файл и его расшифровка уходят в <сюжет>/.rm/trash
+    // (не стираются — кривую запись можно вернуть руками). Буквы остальных озвучек не меняются, буква удалённой не выдаётся заново.
+    if (method === "POST" && parts[1] === "stories" && parts[3] === "voice" && parts[4] === "delete") {
+      const id = await requireStory(parts[2]!);
+      const dir = join(opts.inboxDir, id);
+      const body = await readJson(req);
+      const name = String(body["name"] ?? "");
+      const m = await scanMontage(dir, id, scanOpts);
+      const take = m.voices.find((v) => v.src.name === name);
+      if (!take) throw new HttpError(404, `нет озвучки «${name}» (есть: ${m.voices.map((v) => v.src.name).join(", ") || "ни одной"})`);
+      // удаляем только аудиофайлы: видео, назначенное озвучкой, не трогаем — с него снимают роль
+      if (!AUDIO_RE.test(name) || !isSafeName(name)) throw new HttpError(400, `«${name}» — не аудиофайл: уберите у него роль озвучки в таблице исходников, файл удалять не нужно`);
+      const trash = join(dir, WORK_DIR, "trash");
+      await mkdir(trash, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      await rename(join(dir, name), join(trash, `${stamp}_${name}`));
+      const tr = take.src.file.replace(/\.[^./\\]+$/, "") + ".transcript.json";
+      await rename(tr, join(trash, `${stamp}_${name.replace(/\.[^.]+$/, "")}.transcript.json`)).catch(() => {});
+      // чистая копия уходит в корзину вместе с записью
+      for (const f of cleanedFiles(dir, name)) await rename(f, join(trash, `${stamp}_чистая_${f.split(/[\\/]/).pop()}`)).catch(() => {});
+      const meta = await readMeta(dir);
+      const letters: Record<string, string> = { ...meta.voiceLetters, ...Object.fromEntries(m.voices.map((v) => [v.src.name, v.letter])) };
+      const rest = m.voices.map((v) => v.src.name).filter((n) => n !== name);
+      const sources = { ...meta.sources };
+      if (rest.length) sources.voice = rest;
+      else delete sources.voice;
+      await writeMeta(dir, { ...meta, voiceLetters: letters, sources });
+      sendJson(res, 200, { deleted: name, letter: take.letter, left: rest, trash: fwd(trash) });
+      return;
+    }
+    // POST /api/stories/:id/settings {count?, muteVideo?} — сколько вариантов нужно в итоге (null — не задано);
+    // muteVideo — звук видео не нужен (владелец запишет озвучку сам): без озвучки ролики собираются без звука
     if (method === "POST" && parts[1] === "stories" && parts[3] === "settings") {
       const id = await requireStory(parts[2]!);
       const dir = join(opts.inboxDir, id);
@@ -461,8 +652,22 @@ export function createHub(opts: HubOptions): { server: Server; jobs: JobQueue; a
           meta.count = n;
         }
       }
+      if ("voiceClean" in body) {
+        if (typeof body["voiceClean"] !== "boolean") throw new HttpError(400, "voiceClean: true или false");
+        if (body["voiceClean"]) delete meta.voiceClean;
+        else meta.voiceClean = false;
+      }
+      if ("muteVideo" in body) {
+        if (typeof body["muteVideo"] !== "boolean") throw new HttpError(400, "muteVideo: true или false");
+        if (body["muteVideo"]) meta.muteVideo = true;
+        else delete meta.muteVideo;
+      }
       await writeMeta(dir, meta);
-      sendJson(res, 200, { count: meta.count ?? null });
+      sendJson(res, 200, {
+        count: meta.count ?? null,
+        ...("muteVideo" in body ? { muteVideo: meta.muteVideo === true } : {}),
+        ...("voiceClean" in body ? { voiceClean: meta.voiceClean !== false } : {}),
+      });
       return;
     }
     // POST /api/stories/:id/crop {source: роль|файл, crop: {x,y,w,h} в долях | null — весь кадр}
@@ -474,6 +679,7 @@ export function createHub(opts: HubOptions): { server: Server; jobs: JobQueue; a
       const want = String(body["source"] ?? "");
       const src = m.roles[want as SourceRole] ?? m.sources.find((x) => x.name === want);
       if (!src) throw new HttpError(404, `нет исходника «${want}»`);
+      if (AUDIO_RE.test(src.name) || src.role === "voice") throw new HttpError(400, `«${src.name}» — звук, кропа у него нет`);
       const crop = body["crop"] === null ? null : cleanCrop(body["crop"]);
       if (body["crop"] !== null && !crop && body["crop"] !== undefined) {
         const c = body["crop"] as Record<string, unknown> | undefined;
@@ -511,8 +717,9 @@ export function createHub(opts: HubOptions): { server: Server; jobs: JobQueue; a
           id: edit.variants[i]?.id ?? String(p.index),
           hook: p.hook.text,
           preset: p.preset,
-          label: montageLabel(p, m.replicas, m.screens.length),
+          label: montageLabel(p, m.voices.length ? m.voiceReplicas : m.replicas, m.screens.length, m.voices.length ? m.roles.talk?.file : undefined),
           duration: p.scenes.reduce((sum, x) => sum + x.trim.end - x.trim.start, 0) / p.speed,
+          scenes: montageScenes(p, edit.variants[i]!, m.voices.length ? m.voiceReplicas : m.replicas, m.voices.length ? m.roles.talk?.file : undefined),
         })),
       });
       return;
@@ -530,7 +737,7 @@ export function createHub(opts: HubOptions): { server: Server; jobs: JobQueue; a
       const job = jobs.add("build", id, async (ctx) => {
         const t0 = Date.now();
         ctx.log(`сборка по листу: ${build.variants.length ? build.variants.join(", ") : "все варианты"}, ${hw === "nvenc" ? "видеокарта" : "процессор"}`);
-        const run = await buildMontage(id, build, opts, { ...opts.hooks, log: ctx.log, progress: ctx.progress, onRun: ctx.setRun });
+        const run = await buildMontage(id, build, opts, { ...opts.hooks, cleanDeps: opts.cleanDeps, log: ctx.log, progress: ctx.progress, onRun: ctx.setRun });
         const ready = run.variants.filter((v) => v.status === "ready").length;
         ctx.log(`готово ${ready} из ${run.count} за ${((Date.now() - t0) / 1000).toFixed(0)} с → ${join(opts.outputDir, id, run.id)}`);
         if (ready === 0) throw new Error("ни один вариант не собран — смотрите ffmpeg.log варианта");
@@ -581,8 +788,8 @@ export function createHub(opts: HubOptions): { server: Server; jobs: JobQueue; a
       const dir = join(opts.inboxDir, id);
       if ((await storyKind(dir)) === "montage") {
         const job = jobs.add("transcribe", id, async (ctx) => {
-          const did = await transcribeTalk(await scanMontage(dir, id, scanOpts), { stt, force: body["force"] === true, log: ctx.log });
-          if (!did) ctx.log("расшифровка основы свежая — нечего делать");
+          const did = await transcribeSound(await scanMontage(dir, id, scanOpts), { stt, force: body["force"] === true, log: ctx.log });
+          if (!did) ctx.log("расшифровка свежая — нечего делать");
         });
         sendJson(res, 202, job);
         return;

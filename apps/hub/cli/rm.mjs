@@ -68,11 +68,12 @@ async function waitJob(id) {
 const HELP = `rm — API ReelsMaker
   brief                          исходники, роли, реплики, лист, проблемы
   replicas [с_сек] [по_сек]       реплики (все или в окне времени)
-  words <с_сек> <по_сек>          слова основы со временем — резать внутри реплики
+  words <с_сек> <по_сек> [файл]   слова источника звука со временем — резать внутри реплики (озвучек несколько — укажите файл)
   frames <роль|файл> <сек>…       кадры jpg → пути (смотрите Read)
   grid <роль|файл> [N=6]          N кадров равномерно по файлу
-  roles talk=<файл> wide=<файл> screen=<файл> [screen=<файл>…]
-  transcribe [--force]            расшифровать основу
+  roles talk=<файл> wide=<файл> screen=<файл> [screen=<файл>…] [voice=<файл>…|voice=]
+  mute on|off                     звук видео не нужен (владелец запишет озвучку): без озвучки ролик без звука
+  transcribe [--force]            расшифровать источники звука (все озвучки, без них основу)
   check                           проверить edit.json
   build [id,id…] [--cpu] [--par N] собрать варианты по edit.json и дождаться
   runs                            прошлые сборки
@@ -99,12 +100,26 @@ async function main() {
       if (m.screens.length > 1) console.log(`Скринкастов ${m.screens.length}: ${m.screens.join(", ")} — в сегменте со screen указывайте "screenFile"`);
       console.log(`Нужно вариантов: ${m.count ? `${m.count} (задал владелец)` : "не задано — по умолчанию 5"}`);
       if (m.problems.length) console.log("Проблемы:\n" + m.problems.map((x) => "  - " + x).join("\n"));
-      console.log(`Расшифровка основы: ${m.transcribed ? (m.transcriptFresh ? "есть" : "устарела") : "нет"}`);
+      if (m.voices.length) {
+        console.log(`Озвучки (${m.voices.length}) — ЗВУК И СУБТИТРЫ ИДУТ С НИХ, видео (основа, дальний, скринкаст) даёт только картинку:`);
+        for (const v of m.voices) console.log(`  ${v.letter}  ${v.name}  ${sec(v.duration)} с, реплик ${v.replicas}, расшифровка: ${v.transcribed ? (v.fresh ? "есть" : "устарела") : "нет"}, очистка: ${v.clean === "ready" ? "звук роликов из чистой копии" : v.clean === "stale" ? "будет сделана при сборке" : "выключена"}`);
+        console.log(`Реплики озвучек имеют id по букве файла (a01, b01…). В сегменте пишите "voice": "b03" (не "replica"); крупный план — "at": <сек основы>.`);
+        if (m.voices.length > 1) console.log("Это ДУБЛИ/ЧАСТИ озвучки: прочитай текст всех файлов, для каждой фразы выбери лучший дубль (без оговорок, чище, живее); разные варианты ролика могут брать разные дубли.");
+      } else if (m.sound === "none") {
+        console.log(`Звук роликов: БЕЗ ЗВУКА (${m.mute ? "владелец отключил звук видео" : "у основы нет звука"}) — собирай по start/end (секунды видео), субтитров не будет; озвучку владелец запишет потом.`);
+      } else console.log(`Расшифровка основы: ${m.transcribed ? (m.transcriptFresh ? "есть" : "устарела") : "нет"}; звук роликов — с основы`);
     }
     const from = cmd === "replicas" && argv[0] ? Number(argv[0]) : -Infinity;
     const to = cmd === "replicas" && argv[1] ? Number(argv[1]) : Infinity;
-    console.log(`Реплики (${m.replicas.length}):`);
-    for (const r of m.replicas) if (r.end >= from && r.start <= to) console.log(`  ${r.id}  ${sec(r.start)}–${sec(r.end)}  (${(r.end - r.start).toFixed(1)} с)  ${r.text}`);
+    const reps = m.voices.length ? m.voiceReplicas : m.replicas;
+    console.log(`Реплики ${m.voices.length ? "озвучек" : "основы"} (${reps.length}):`);
+    let lastSource = null;
+    for (const r of reps) {
+      if (!(r.end >= from && r.start <= to)) continue;
+      if (r.source && r.source !== lastSource && m.voices.length > 1) console.log(`  — ${r.source}:`);
+      lastSource = r.source ?? null;
+      console.log(`  ${r.id}  ${sec(r.start)}–${sec(r.end)}  (${(r.end - r.start).toFixed(1)} с)  ${r.text}`);
+    }
     if (cmd === "brief") {
       if (m.editError) console.log(m.editError);
       else if (!m.edit) console.log("Монтажного листа edit.json ещё нет.");
@@ -119,9 +134,9 @@ async function main() {
     return;
   }
   if (cmd === "words") {
-    const [from, to] = argv.map(Number);
-    if (!Number.isFinite(from) || !Number.isFinite(to)) fail("words: укажите окно секундами: words <с> <по>");
-    const r = await api(`${base}/words?from=${from}&to=${to}`);
+    const [from, to] = argv.slice(0, 2).map(Number);
+    if (!Number.isFinite(from) || !Number.isFinite(to)) fail("words: укажите окно секундами: words <с> <по> [файл озвучки]");
+    const r = await api(`${base}/words?from=${from}&to=${to}${argv[2] ? `&file=${enc(argv[2])}` : ""}`);
     // строки по ~8 слов: «12.34 слово 12.71 слово …» — время начала каждого слова
     for (let i = 0; i < r.words.length; i += 8)
       console.log("  " + r.words.slice(i, i + 8).map((w) => `${w.start.toFixed(2)} ${w.text.trim()}`).join("  ") + `  |${r.words[Math.min(i + 7, r.words.length - 1)].end.toFixed(2)}`);
@@ -130,7 +145,7 @@ async function main() {
   }
   if (cmd === "frames" || cmd === "grid") {
     const source = argv.shift();
-    if (!source) fail(`${cmd}: укажите роль (talk, wide, screen) или файл`);
+    if (!source) fail(`${cmd}: укажите роль (talk, wide, screen) или файл (у озвучки кадров нет)`);
     const body = cmd === "grid" ? { source, grid: Number(argv[0] || 6) } : { source, times: argv.map(Number) };
     if (cmd === "frames" && (!body.times.length || body.times.some((t) => !Number.isFinite(t)))) fail("frames: укажите секунды числами");
     const r = await api(`${base}/frames`, body);
@@ -140,13 +155,21 @@ async function main() {
   if (cmd === "roles") {
     const body = {};
     for (const a of argv) {
-      const m = /^(talk|wide|screen)=(.*)$/.exec(a);
-      if (!m) fail(`roles: «${a}» — ожидается talk=<файл>, wide=<файл>, screen=<файл> (screen= можно несколько раз)`);
-      if (m[1] === "screen" && body.screen) body.screen = [].concat(body.screen, m[2]);
+      const m = /^(talk|wide|screen|voice)=(.*)$/.exec(a);
+      if (!m) fail(`roles: «${a}» — ожидается talk=<файл>, wide=<файл>, screen=<файл> (screen= можно несколько раз), voice=<аудиофайл> (можно несколько раз; voice= без файла — озвучку снять)`);
+      // скринкастов и озвучек можно несколько: ключ повторяют
+      if ((m[1] === "screen" || m[1] === "voice") && body[m[1]]) body[m[1]] = [].concat(body[m[1]], m[2]);
       else body[m[1]] = m[2];
     }
     const r = await api(`${base}/roles`, body);
     console.log("Роли: " + Object.entries(r.roles).map(([k, v]) => `${k}=${v}`).join(", "));
+    return;
+  }
+  if (cmd === "mute") {
+    const v = argv[0];
+    if (v !== "on" && v !== "off") fail("mute: укажите on (звук видео не нужен) или off");
+    const r = await api(`${base}/settings`, { muteVideo: v === "on" });
+    console.log(r.muteVideo ? "Звук видео отключён: без озвучки ролики собираются без звука." : "Звук видео включён: без озвучки звук идёт с основы.");
     return;
   }
   if (cmd === "transcribe") {

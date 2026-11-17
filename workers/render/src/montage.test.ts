@@ -190,3 +190,179 @@ test("несколько скринкастов: сегмент выбирает
   assert.match(bad, /сегмент 1: screenFile без screen/);
   assert.match(bad, /сегмент 2: screen 40 вне скринкаста «экран — гитхаб\.mp4» \(0–30 с\)/);
 });
+
+// ─────────────────────────────── озвучка (отдельный аудиофайл) ───────────────────────────────
+
+const VOICE_TR: Transcript = {
+  text: "",
+  words: [w("Новый", 0.4, 0.8), w("голос.", 0.8, 1.3), w("Второй", 3.0, 3.4), w("кусок", 3.4, 3.9), w("финал.", 6.0, 6.6)],
+};
+const voiceInput = (over: Partial<MontageInput> = {}): MontageInput =>
+  input({
+    talk: { name: "челси.mp4", file: "C:/s/челси.mp4", duration: 30, transcript: null },
+    replicas: [],
+    voices: [{ name: "озвучка.wav", file: "C:/s/озвучка.wav", duration: 8, transcript: VOICE_TR }],
+    voiceReplicas: splitReplicas(VOICE_TR, 8, { prefix: "a" }).map((r) => ({ ...r, source: "озвучка.wav" })),
+    ...over,
+  });
+
+test("реплики озвучки: свой префикс a01, a02…", () => {
+  assert.deepEqual(splitReplicas(VOICE_TR, 8, { prefix: "a" }).map((r) => r.id), ["a01", "a02", "a03"]);
+});
+
+test("озвучка: звук и субтитры с аудиофайла, картинка — крупный (основа), дальний, экран", () => {
+  const edit: EditList = {
+    version: 1,
+    variants: [
+      { id: "a", segments: [{ voice: "a01" }, { voice: "a02", at: 12.5 }, { voice: "a03", view: "wide", wideAt: 4, screen: 7 }, { start: 0.4, end: 1.3, at: 2 }] },
+    ],
+  };
+  const res = editToPlans(edit, voiceInput());
+  assert.deepEqual(res.errors, []);
+  const plan = res.plans[0]!;
+  for (const s of plan.scenes) {
+    assert.equal(s.file, "C:/s/озвучка.wav", "звук всегда с озвучки");
+    assert.equal(s.clipId, "озвучка.wav");
+    assert.equal(s.hasAudio, true);
+  }
+  assert.deepEqual(plan.scenes[0]!.picture, { file: "C:/s/челси.mp4", start: plan.scenes[0]!.trim.start }, "крупный: та же секунда основы, что у звука");
+  assert.equal(plan.scenes[1]!.picture!.start, 12.5, "at — секунда основы");
+  assert.equal(plan.scenes[2]!.picture!.file, "C:/s/общий.mp4");
+  assert.equal(plan.scenes[2]!.picture!.start, 4);
+  assert.equal(plan.scenes[2]!.inset!.start, 7);
+  assert.equal(plan.scenes[3]!.picture!.start, 2);
+  assert.deepEqual([plan.scenes[3]!.trim.start, plan.scenes[3]!.trim.end], [0.4, 1.3], "start/end — секунды озвучки");
+  assert.match(plan.hook.text, /Новый голос/, "хук — из первой реплики озвучки");
+  assert.ok(res.clips.get("озвучка.wav")?.transcript, "субтитры — из расшифровки озвучки");
+  assert.equal(res.clips.has("челси.mp4"), false);
+
+  const job = buildFfmpegJob({ plan, preset: presets.find((p) => p.id === plan.preset)!, clips: res.clips, outFile: "out.mp4", presetsDir: PRESETS_DIR });
+  const inputs = job.args.filter((_, i, a) => a[i - 1] === "-i");
+  assert.deepEqual(inputs.slice(0, 5), ["C:/s/озвучка.wav", "C:/s/челси.mp4", "C:/s/озвучка.wav", "C:/s/челси.mp4", "C:/s/озвучка.wav"]);
+  assert.match(job.filterGraph, /\[0:a\]atrim=/, "звук первой сцены — с озвучки");
+  assert.match(job.filterGraph, /\[1:v\]trim=start=/, "картинка первой сцены — с основы");
+  assert.match(job.filterGraph, /tpad=stop_mode=clone/, "картинка короче звука держит последний кадр");
+  const ass = job.staged.find((f) => f.name === "captions.ass")!.content!;
+  assert.match(ass, /новый/i, "субтитры из слов озвучки");
+});
+
+test("озвучка: replica при озвучке и voice без озвучки — понятные ошибки; сдвиг основы; основа короче", () => {
+  const bad = editToPlans({ version: 1, variants: [{ id: "x", segments: [{ replica: "r01" }, { voice: "a99" }, {}] }] }, voiceInput());
+  const all = bad.errors.join("\n");
+  assert.match(all, /сегмент 0: в сюжете есть озвучка — звук берётся из неё, укажите "voice"/);
+  assert.match(all, /сегмент 1: нет реплики a99/);
+  assert.match(all, /сегмент 2: нужна voice или start\/end/);
+  const none = editToPlans({ version: 1, variants: [{ id: "x", segments: [{ voice: "a01" }] }] }, input());
+  assert.match(none.errors.join("\n"), /voice «a01», а озвучки в сюжете нет/);
+  const warn = editToPlans({ version: 1, variants: [{ id: "x", segments: [{ replica: "r02", at: 3 }] }] }, input());
+  assert.match(warn.warnings.join("\n"), /at работает только при озвучке/);
+
+  const off = editToPlans({ version: 1, layout: { talkOffset: 1.5 }, variants: [{ id: "a", segments: [{ voice: "a03" }] }] }, voiceInput());
+  assert.equal(off.plans[0]!.scenes[0]!.picture!.start, round(off.plans[0]!.scenes[0]!.trim.start + 1.5));
+  // основа короче нужного: начало сдвигается так, чтобы картинка поместилась
+  const short = editToPlans({ version: 1, variants: [{ id: "a", segments: [{ voice: "a03", at: 29.95 }] }] }, voiceInput({ talk: { name: "челси.mp4", file: "C:/s/челси.mp4", duration: 30, transcript: null } }));
+  assert.ok(short.plans[0]!.scenes[0]!.picture!.start <= 30 - (short.plans[0]!.scenes[0]!.trim.end - short.plans[0]!.scenes[0]!.trim.start));
+  assert.match(short.warnings.join("\n"), /основа длиной 30 с/);
+});
+
+const round = (n: number) => Math.round(n * 1000) / 1000;
+
+// ─────────────────────────────── несколько озвучек (дубли) и режим «без звука» ───────────────────────────────
+
+const TAKE2: Transcript = { text: "", words: [w("Хороший", 0.5, 1.0), w("дубль.", 1.0, 1.6), w("Ещё", 3.0, 3.3), w("раз.", 3.3, 3.8)] };
+const twoTakes = (): MontageInput =>
+  voiceInput({
+    voices: [
+      { name: "озвучка.wav", file: "C:/s/озвучка.wav", duration: 8, transcript: VOICE_TR },
+      { name: "озвучка 2.wav", file: "C:/s/озвучка 2.wav", duration: 5, transcript: TAKE2 },
+    ],
+    voiceReplicas: [
+      ...splitReplicas(VOICE_TR, 8, { prefix: "a" }).map((r) => ({ ...r, source: "озвучка.wav" })),
+      ...splitReplicas(TAKE2, 5, { prefix: "b" }).map((r) => ({ ...r, source: "озвучка 2.wav" })),
+    ],
+  });
+
+test("несколько озвучек: файл берётся из реплики (a01, b02…), звук и субтитры — с нужного дубля", () => {
+  const res = editToPlans(
+    { version: 1, variants: [{ id: "a", segments: [{ voice: "b01" }, { voice: "a02", at: 3 }, { voice: "b02", view: "wide" }] }] },
+    twoTakes(),
+  );
+  assert.deepEqual(res.errors, []);
+  const sc = res.plans[0]!.scenes;
+  assert.deepEqual(sc.map((x) => x.file), ["C:/s/озвучка 2.wav", "C:/s/озвучка.wav", "C:/s/озвучка 2.wav"], "каждая сцена — со своего файла");
+  assert.deepEqual(sc.map((x) => x.clipId), ["озвучка 2.wav", "озвучка.wav", "озвучка 2.wav"]);
+  assert.deepEqual(sc.map((x) => x.duration), [5, 8, 5]);
+  assert.ok(res.clips.get("озвучка 2.wav")?.transcript && res.clips.get("озвучка.wav")?.transcript, "субтитры — из расшифровки каждого дубля");
+  assert.match(res.plans[0]!.hook.text, /Хороший дубль/, "хук — из первой реплики (дубль b)");
+  // граф: звук сцен — со входов разных файлов
+  const plan = res.plans[0]!;
+  const job = buildFfmpegJob({ plan, preset: presets.find((p) => p.id === plan.preset)!, clips: res.clips, outFile: "out.mp4", presetsDir: PRESETS_DIR });
+  const inputs = job.args.filter((_, i, a) => a[i - 1] === "-i");
+  assert.equal(inputs[0], "C:/s/озвучка 2.wav");
+  assert.equal(inputs[2], "C:/s/озвучка.wav");
+});
+
+test("несколько озвучек: start/end требуют voiceFile; ошибки называют, какие файлы есть", () => {
+  const res = editToPlans(
+    { version: 1, variants: [{ id: "x", segments: [{ start: 0.4, end: 1.3 }, { start: 0.4, end: 1.3, voiceFile: "нет" }, { start: 0.5, end: 1.4, voiceFile: "озвучка 2" }] }] },
+    twoTakes(),
+  );
+  const all = res.errors.join("\n");
+  assert.match(all, /сегмент 0: озвучек несколько — укажите voiceFile \(есть: озвучка\.wav, озвучка 2\.wav\)/);
+  assert.match(all, /сегмент 1: нет озвучки «нет»/);
+  const ok = editToPlans({ version: 1, variants: [{ id: "y", segments: [{ start: 0.5, end: 1.4, voiceFile: "озвучка 2" }] }] }, twoTakes());
+  assert.deepEqual(ok.errors, []);
+  assert.equal(ok.plans[0]!.scenes[0]!.file, "C:/s/озвучка 2.wav", "voiceFile — без расширения");
+  // единственная озвучка: voiceFile не нужен
+  assert.deepEqual(editToPlans({ version: 1, variants: [{ id: "z", segments: [{ start: 0.5, end: 1.4 }] }] }, voiceInput()).errors, []);
+});
+
+test("звук видео отключён (mute): сцены без звука и без субтитров, картинка по start/end, предупреждение", () => {
+  const edit: EditList = { version: 1, variants: [{ id: "a", hook: "Хук", segments: [{ start: 2, end: 6 }, { start: 6, end: 10, screen: 3, view: "wide" }] }] };
+  const res = editToPlans(edit, input({ mute: true }));
+  assert.deepEqual(res.errors, []);
+  const plan = res.plans[0]!;
+  assert.ok(plan.scenes.every((x) => x.hasAudio === false), "звук основы в ролик не попадает");
+  assert.equal(res.clips.get("голова.mp4")?.transcript, undefined, "субтитров нет");
+  assert.equal(res.clips.get("голова.mp4")?.hasAudio, false);
+  assert.match(res.warnings.join("\n"), /звук видео отключён, озвучки нет — ролики соберутся без звука/);
+  const job = buildFfmpegJob({ plan, preset: presets.find((p) => p.id === plan.preset)!, clips: res.clips, outFile: "out.mp4", presetsDir: PRESETS_DIR });
+  assert.match(job.filterGraph, /anullsrc=/, "вместо звука основы — тишина");
+  assert.doesNotMatch(job.filterGraph, /\[\d+:a\]/, "звуковая дорожка видео не читается");
+  // озвучка важнее mute: звук идёт с неё
+  const withVoice = editToPlans({ version: 1, variants: [{ id: "v", segments: [{ voice: "a01" }] }] }, voiceInput({ mute: true }));
+  assert.deepEqual(withVoice.errors, []);
+  assert.equal(withVoice.plans[0]!.scenes[0]!.hasAudio, true);
+  assert.doesNotMatch(withVoice.warnings.join("\n"), /отключён/);
+  // без mute звук идёт с основы, как раньше
+  assert.equal(editToPlans(edit, input()).plans[0]!.scenes[0]!.hasAudio, true);
+});
+
+// ─────────────────────────────── «кадры не скачут»: кадр держится не меньше 2,5 с ───────────────────────────────
+
+test("кадры: вырезанная пауза посреди одного кадра его не рвёт; короткий кадр после скачка — предупреждение", () => {
+  const warn = (segments: EditList["variants"][number]["segments"]) => editToPlans({ version: 1, variants: [{ id: "a", segments }] }, voiceInput()).warnings.filter((x) => /кадр держится/.test(x));
+  // фон идёт непрерывно (at по умолчанию = секунда звука): две сцены по 3 с — один кадр на 6 с
+  assert.deepEqual(warn([{ start: 0, end: 3 }, { start: 3, end: 6 }]), []);
+  // вторая сцена — скачок фона и всего 1,2 с
+  assert.match(warn([{ start: 0, end: 3, at: 0 }, { start: 3, end: 4.2, at: 10 }])[0]!, /^вариант a: кадр держится 1,2 с \(сцена 2\) — короче 2,5 с, картинка будет скакать/);
+  // скринкаст продолжается с того же места (5 + 3 = 8): один кадр; пауза в звуке его не рвёт
+  assert.deepEqual(warn([{ start: 0, end: 3, screen: 5, screenFile: "экран" }, { start: 3, end: 6, screen: 8, screenFile: "экран" }]), []);
+  // а если скринкаст прыгнул назад-вперёд — это новые кадры, и они достаточно длинные (по 3 с)
+  assert.deepEqual(warn([{ start: 0, end: 3, screen: 5 }, { start: 3, end: 6, screen: 30 }]), []);
+  // экран на 1 с посреди видео — мелькание
+  assert.match(warn([{ start: 0, end: 3 }, { start: 3, end: 4, screen: 5 }])[0]!, /сцена 2/);
+  // два коротких подряд, но разных: оба названы
+  assert.equal(warn([{ start: 0, end: 3 }, { start: 3, end: 4, screen: 5 }, { start: 4, end: 5.2 , at: 20 }]).length, 2);
+  // открывающий кадр 2,5 с — допустим
+  assert.deepEqual(warn([{ start: 0, end: 2.5 }, { start: 2.5, end: 8, screen: 5 }]), []);
+});
+
+test("подпись сцены note принимается и на сборку не влияет", () => {
+  const edit: EditList = { version: 1, variants: [{ id: "a", segments: [{ voice: "a01", note: "a01: приветствие, вид" }, { voice: "a02", note: "a02: экран" }] }] };
+  const res = editToPlans(edit, voiceInput());
+  assert.deepEqual(res.errors, []);
+  assert.equal(res.plans[0]!.scenes.length, 2);
+  const plain = editToPlans({ version: 1, variants: [{ id: "a", segments: [{ voice: "a01" }, { voice: "a02" }] }] }, voiceInput());
+  assert.deepEqual(res.plans[0]!.scenes, plain.plans[0]!.scenes, "сцены те же — note в схему не попадает");
+});

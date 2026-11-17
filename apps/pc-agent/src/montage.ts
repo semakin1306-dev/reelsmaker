@@ -1,16 +1,24 @@
-// Сюжет «из исходников»: основа (говорящая голова со звуком), дальний план (перебивки), скринкаст (вставки).
+// Сюжет «из исходников»: основа (говорящая голова со звуком), дальний план (перебивки), скринкаст (вставки)
+// и по желанию озвучка — отдельные аудиофайлы (дублей может быть несколько), которые заменяют звук основы
+// (основа тогда даёт только картинку). Звук видео можно отключить совсем (story.json → muteVideo).
 // Роли — из story.json или по имени файла; реплики — из расшифровки основы; монтажный лист — edit.json в папке сюжета.
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { run as coreRun } from "@reels-factory/core";
 import { cleanCrop, cropFilter, parseClipName, splitReplicas, type Crop, type EditList, type Replica, type Transcript } from "@reels-factory/render";
-import { probeClip, type ClipProbe } from "./probe.ts";
+import { AUDIO_RE, probeClip, type ClipProbe } from "./probe.ts";
+import { cleanedPath, isCleanFresh } from "./voice-clean.ts";
 import { VIDEO_RE } from "./story.ts";
 import { isTranscriptFresh, transcribeFiles, transcriptPath, writeTranscript, type SttConfig, type SttRun } from "./stt.ts";
 
-export type SourceRole = "talk" | "wide" | "screen";
-export const SOURCE_ROLES: readonly SourceRole[] = ["talk", "wide", "screen"];
-export const ROLE_TITLE: Record<SourceRole, string> = { talk: "основа (крупный, со звуком)", wide: "дальний план", screen: "скринкаст" };
+export type SourceRole = "talk" | "wide" | "screen" | "voice";
+export const SOURCE_ROLES: readonly SourceRole[] = ["talk", "wide", "screen", "voice"];
+export const ROLE_TITLE: Record<SourceRole, string> = {
+  talk: "основа (крупный, со звуком)",
+  wide: "дальний план",
+  screen: "скринкаст",
+  voice: "озвучка (звук отдельным файлом)",
+};
 
 /** Настройки сюжета, которые правит владелец или агент: роли и кроп исходников. */
 export const META_FILE = "story.json";
@@ -23,16 +31,35 @@ const ROLE_RE: Record<SourceRole, RegExp> = {
   talk: /крупн|голов|говор|основ|talk|close|a[-_ ]?roll/i,
   wide: /дальн|общ|wide|перебив|b[-_ ]?roll/i,
   screen: /экран|скрин|screen|интерфейс|record/i,
+  voice: /озвуч|голос|аудио|звук|дикт|voice|audio|narrat/i,
 };
 
+/** Файл озвучки, записанный в интерфейсе: «озвучка.wav», «озвучка 2.wav»… */
+export const VOICE_BASE = "озвучка";
+
+/** Видео и аудио сюжета: аудио годится только как озвучка. */
+export const SOURCE_RE = new RegExp(`${VIDEO_RE.source}|${AUDIO_RE.source}`, "i");
+
 export function guessRole(name: string): SourceRole | null {
+  if (AUDIO_RE.test(name)) return "voice";
   for (const role of SOURCE_ROLES) if (ROLE_RE[role].test(name)) return role;
   return null;
 }
 
 export interface StoryMeta {
-  /** роли исходников; скринкастов может быть несколько (массив имён) */
+  /** роли исходников; скринкастов и озвучек может быть несколько (массив имён) */
   sources?: Partial<Record<SourceRole, string | string[]>>;
+  /** звук видео не нужен (владелец запишет озвучку сам): без озвучки ролик собирается без звука */
+  muteVideo?: boolean;
+  /** false — озвучки идут как записаны, без очистки (по умолчанию очистка включена: «чистая» копия в .rm/clean) */
+  voiceClean?: boolean;
+  /** микрофон записи (метка устройства) по имени файла озвучки: ключ сохранённого образца шума для очистки */
+  voiceMic?: Record<string, string>;
+  /**
+   * буква озвучки по имени файла (a, b, c…): закреплена за файлом навсегда, чтобы удаление или перестановка дублей
+   * не сдвигали id реплик в листе. Удалённые файлы остаются в списке — их буква не выдаётся заново.
+   */
+  voiceLetters?: Record<string, string>;
   /** сколько вариантов владелец хочет в итоге (агент берёт из brief) */
   count?: number;
   /** кроп по имени файла, в долях кадра; нет — весь кадр */
@@ -54,7 +81,7 @@ export async function writeMeta(dir: string, meta: StoryMeta): Promise<void> {
 /** Сюжет из исходников, если роли заданы в story.json или хоть одно видео без номера узнаётся по имени. */
 export function isMontageStory(videoNames: readonly string[], meta: StoryMeta): boolean {
   if (meta.sources && Object.values(meta.sources).some((v) => (Array.isArray(v) ? v.length > 0 : Boolean(v)))) return true;
-  return videoNames.some((n) => !parseClipName(n) && guessRole(n) !== null);
+  return videoNames.some((n) => !parseClipName(n) && guessRole(n) !== null && !AUDIO_RE.test(n));
 }
 
 export interface SourceInfo {
@@ -64,6 +91,31 @@ export interface SourceInfo {
   probe: ClipProbe | null;
   /** кроп из story.json (владелец выбирает в интерфейсе) */
   crop: Crop | null;
+}
+
+/** Первая буква a–z, которой нет среди занятых (все заняты — z). */
+export function nextVoiceLetter(used: Iterable<string>): string {
+  const taken = new Set(used);
+  for (let i = 0; i < 26; i++) {
+    const l = String.fromCharCode(97 + i);
+    if (!taken.has(l)) return l;
+  }
+  return "z";
+}
+
+/** Один файл озвучки: расшифровка и реплики со своей буквой (a, b, c… по порядку файлов). */
+export interface VoiceTake {
+  src: SourceInfo;
+  /** файл, из которого берётся ЗВУК в роликах: чистая копия, если она готова, иначе оригинал */
+  file: string;
+  /** микрофон, на котором сделана запись (если запись сделана в интерфейсе) */
+  mic: string | null;
+  /** ready — чистая копия готова и используется; stale — нужна (нет или устарела); off — очистка выключена */
+  clean: "ready" | "stale" | "off";
+  letter: string;
+  transcript: Transcript | null;
+  fresh: boolean;
+  replicas: Replica[];
 }
 
 export interface MontageScan {
@@ -79,6 +131,14 @@ export interface MontageScan {
   transcript: Transcript | null;
   transcriptFresh: boolean;
   replicas: Replica[];
+  /** озвучки (если есть) по порядку: у каждой своя расшифровка и реплики a01…, b01… — источник звука вместо основы */
+  voices: VoiceTake[];
+  /** реплики всех озвучек подряд (у каждой source — файл) */
+  voiceReplicas: Replica[];
+  /** звук видео отключён владельцем */
+  mute: boolean;
+  /** очистка озвучки включена (story.json → voiceClean не false) */
+  cleanOn: boolean;
   edit: EditList | null;
   /** ошибка чтения edit.json */
   editError: string | null;
@@ -93,7 +153,7 @@ export interface MontageScanOptions {
 export async function scanMontage(dir: string, id: string, opts: MontageScanOptions): Promise<MontageScan> {
   const probe = opts.probe ?? probeClip;
   const meta = await readMeta(dir);
-  const names = (await readdir(dir)).filter((f) => VIDEO_RE.test(f)).sort((a, b) => a.localeCompare(b, "ru"));
+  const names = (await readdir(dir)).filter((f) => SOURCE_RE.test(f)).sort((a, b) => a.localeCompare(b, "ru"));
   const problems: string[] = [];
   const sources: SourceInfo[] = [];
   for (const name of names) {
@@ -104,8 +164,12 @@ export async function scanMontage(dir: string, id: string, opts: MontageScanOpti
   }
   const roles: Partial<Record<SourceRole, SourceInfo>> = {};
   const screens: SourceInfo[] = [];
+  const voiceSources: SourceInfo[] = [];
+  const mute = meta.muteVideo === true;
   for (const role of SOURCE_ROLES) {
     const raw = meta.sources?.[role];
+    // "" у озвучки — владелец отказался от неё: аудиофайл по расширению не подбираем
+    if (role === "voice" && raw === "") continue;
     const fixed = (Array.isArray(raw) ? raw : raw ? [raw] : []).filter((x): x is string => typeof x === "string" && x !== "");
     const pinned: SourceInfo[] = [];
     for (const name of fixed) {
@@ -113,32 +177,65 @@ export async function scanMontage(dir: string, id: string, opts: MontageScanOpti
       if (src && !src.role) pinned.push(src);
       else if (!src) problems.push(`story.json: ${ROLE_TITLE[role]} — файла «${name}» в папке нет${pinned.length ? "" : ", роль подобрана по имени"}`);
     }
-    // скринкастов может быть несколько: все заданные, иначе все узнанные по имени; основа и дальний — по одному
-    const guessed = sources.filter((s) => !s.role && guessRole(s.name) === role);
-    const picked = pinned.length ? pinned : role === "screen" ? guessed : guessed.slice(0, 1);
-    for (const src of role === "screen" ? picked : picked.slice(0, 1)) {
+    // скринкастов и озвучек может быть несколько: все заданные, иначе все узнанные по имени; остальные роли — по одному.
+    // Аудиофайл — только озвучка; видео «озвучка…» по имени озвучкой не считаем (его назначают явно)
+    const guessed = sources.filter((s) => !s.role && guessRole(s.name) === role && (role === "voice") === AUDIO_RE.test(s.name));
+    const multi = role === "screen" || role === "voice";
+    const picked = pinned.length ? pinned : multi ? guessed : guessed.slice(0, 1);
+    for (const src of multi ? picked : picked.slice(0, 1)) {
       src.role = role;
       if (!roles[role]) roles[role] = src;
       if (role === "screen") screens.push(src);
+      if (role === "voice") voiceSources.push(src);
     }
   }
-  if (!roles.talk) problems.push("не назначена основа (видео со звуком): назовите файл «голова…»/«крупный…» или задайте роль");
-  else if (roles.talk.probe && !roles.talk.probe.hasAudio) problems.push(`${roles.talk.name}: у основы нет звука`);
+  if (!roles.talk) problems.push("не назначена основа (видео): назовите файл «голова…»/«крупный…» или задайте роль");
+  else if (roles.talk.probe && !roles.talk.probe.hasAudio && !voiceSources.length) {
+    problems.push(`${roles.talk.name}: у основы нет звука — ролики соберутся без звука; запишите озвучку (кнопка с микрофоном) или положите аудиофайл в папку сюжета`);
+  }
+  for (const v of voiceSources) if (v.probe && !v.probe.hasAudio) problems.push(`${v.name}: в файле озвучки нет звука`);
   if (!roles.wide) problems.push("нет дальнего плана — перебивок не будет");
   if (!roles.screen) problems.push("нет скринкаста — вставок экрана не будет");
 
+  const readTr = async (file: string): Promise<Transcript | null> => {
+    try {
+      return JSON.parse(await readFile(transcriptPath(file), "utf8")) as Transcript;
+    } catch {
+      return null;
+    }
+  };
   let transcript: Transcript | null = null;
   let transcriptFresh = false;
   if (roles.talk) {
-    try {
-      transcript = JSON.parse(await readFile(transcriptPath(roles.talk.file), "utf8")) as Transcript;
-    } catch {
-      transcript = null;
-    }
+    transcript = await readTr(roles.talk.file);
     transcriptFresh = await isTranscriptFresh(roles.talk.file);
-    if (!transcript) problems.push("основа ещё не расшифрована");
+    // основа без звука расшифровке не подлежит; при озвучке звук не с неё
+    if (!transcript && !voiceSources.length && !mute && roles.talk.probe?.hasAudio !== false) problems.push("основа ещё не расшифрована");
   }
   const replicas = transcript && roles.talk?.probe ? splitReplicas(transcript, roles.talk.probe.duration) : [];
+  const voices: VoiceTake[] = [];
+  const cleanOn = meta.voiceClean !== false;
+  const letters = { ...meta.voiceLetters };
+  for (const src of voiceSources) {
+    const tr = await readTr(src.file);
+    const fresh = await isTranscriptFresh(src.file);
+    if (!tr) problems.push(`озвучка «${src.name}» ещё не расшифрована`);
+    // буква файла: a, b, c… — так реплики разных дублей не путаются (a01, b01…); закреплена за файлом в story.json
+    const letter = (letters[src.name] ??= nextVoiceLetter(Object.values(letters)));
+    const replicas = tr && src.probe ? splitReplicas(tr, src.probe.duration, { prefix: letter }).map((r) => ({ ...r, source: src.name })) : [];
+    const cleanFresh = cleanOn && (await isCleanFresh(dir, src.name));
+    voices.push({
+      src,
+      file: cleanFresh ? cleanedPath(dir, src.name) : src.file,
+      clean: !cleanOn ? "off" : cleanFresh ? "ready" : "stale",
+      mic: meta.voiceMic?.[src.name] ?? null,
+      letter,
+      transcript: tr,
+      fresh,
+      replicas,
+    });
+  }
+  const voiceReplicas = voices.flatMap((v) => v.replicas);
 
   let edit: EditList | null = null;
   let editError: string | null = null;
@@ -148,22 +245,51 @@ export async function scanMontage(dir: string, id: string, opts: MontageScanOpti
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") editError = `edit.json: ${(e as Error).message}`;
   }
   const count = Number.isInteger(meta.count) && (meta.count as number) > 0 ? (meta.count as number) : null;
-  return { id, dir, sources, roles, screens, count, transcript, transcriptFresh, replicas, edit, editError, problems };
+  return { id, dir, sources, roles, screens, count, transcript, transcriptFresh, replicas, voices, voiceReplicas, mute, cleanOn, edit, editError, problems };
 }
 
-/** Расшифровать основу, если расшифровки нет или она старше файла (force — всегда). */
-export async function transcribeTalk(
+/** Файлы, у которых берётся звук (и расшифровка): озвучки, без них основа — если звук видео не отключён. */
+function soundFiles(scan: MontageScan): { kind: "voice" | "talk"; items: { src: SourceInfo; fresh: boolean }[] } | null {
+  if (scan.voices.length) return { kind: "voice", items: scan.voices.map((v) => ({ src: v.src, fresh: v.fresh })) };
+  const t = scan.roles.talk;
+  if (t && !scan.mute && t.probe?.hasAudio !== false) return { kind: "talk", items: [{ src: t, fresh: scan.transcriptFresh }] };
+  return null;
+}
+
+/** Какой звук войдёт в ролик: озвучка (дубли), звук основы или никакого. */
+export function soundMode(scan: MontageScan): "voice" | "talk" | "none" {
+  return soundFiles(scan)?.kind ?? "none";
+}
+
+/** Источнику звука нужна расшифровка: её нет или она старше файла. */
+export function needsTranscription(scan: MontageScan): boolean {
+  const s = soundFiles(scan);
+  return Boolean(s && s.items.some((i) => !i.fresh));
+}
+
+/** Расшифровать источники звука (все озвучки одним запуском модели, без них основу), у которых расшифровки нет или она старше файла (force — все). */
+export async function transcribeSound(
   scan: MontageScan,
   opts: { stt: SttConfig; force?: boolean; run?: SttRun; log?: (m: string) => void },
 ): Promise<boolean> {
-  const talk = scan.roles.talk;
-  if (!talk) throw new Error("не назначена основа — расшифровывать нечего");
-  if (!opts.force && scan.transcriptFresh) return false;
-  opts.log?.(`расшифровка основы ${talk.name}, загрузка модели…`);
-  const [r] = await transcribeFiles([talk.file], opts.stt, opts.run);
-  if (!r || !r.ok) throw new Error(`основа не расшифрована: ${r && !r.ok ? r.error : "нет ответа"}`);
-  await writeTranscript(talk.file, r.transcript);
-  opts.log?.(`основа расшифрована: ${r.transcript.words.length} слов`);
+  const sound = soundFiles(scan);
+  if (!sound) throw new Error("нечего расшифровывать: звук видео отключён или у основы нет звука — запишите озвучку");
+  const todo = sound.items.filter((i) => opts.force || !i.fresh);
+  if (todo.length === 0) return false;
+  const what = sound.kind === "voice" ? "озвучки" : "основы";
+  opts.log?.(`расшифровка ${what}: ${todo.map((i) => i.src.name).join(", ")}, загрузка модели…`);
+  const results = await transcribeFiles(todo.map((i) => i.src.file), opts.stt, opts.run);
+  const failed: string[] = [];
+  for (const [i, item] of todo.entries()) {
+    const r = results[i];
+    if (!r || !r.ok) {
+      failed.push(`${item.src.name}: ${r && !r.ok ? r.error : "нет ответа"}`);
+      continue;
+    }
+    await writeTranscript(item.src.file, r.transcript);
+    opts.log?.(`${item.src.name} расшифрована: ${r.transcript.words.length} слов`);
+  }
+  if (failed.length) throw new Error(`не расшифровано (${what}): ${failed.join("; ")}`);
   return true;
 }
 
